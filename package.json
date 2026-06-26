@@ -1,0 +1,26 @@
+{
+  "name": "@raffle-platform/contracts",
+  "version": "0.1.0",
+  "description": "Smart contracts for the btclottery.io enterprise lottery & raffle platform (Hardhat 3 + viem)",
+  "private": true,
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "build": "hardhat compile",
+    "clean": "hardhat clean",
+    "lint": "echo \"lint not configured yet\""
+  },
+  "keywords": ["blockchain", "lottery", "raffle", "solidity", "hardhat"],
+  "author": "",
+  "license": "UNLICENSED",
+  "type": "module",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ignition": "^3.1.7",
+    "@nomicfoundation/hardhat-toolbox-viem": "^5.0.7",
+    "@types/node": "^22.20.0",
+    "forge-std": "github:foundry-rs/forge-std#v1.9.4",
+    "hardhat": "^3.9.0",
+    "typescript": "~6.0.3",
+    "viem": "^2.53.1"
+  }
+}
