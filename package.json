@@ -1,5 +1,5 @@
 {
-  "name": "@raffle-platform/contracts",
+  "name": "@btclottery-platform/contracts",
   "version": "0.1.0",
   "description": "Smart contracts for the btclottery.io enterprise lottery & raffle platform (Hardhat 3 + viem)",
   "private": true,
