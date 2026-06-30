@@ -1,46 +1,37 @@
-import assert from "node:assert/strict";
-import { describe, it } from "node:test";
-
+import { expect } from "chai";
 import { network } from "hardhat";
 
-describe("Counter", async function () {
-  const { viem } = await network.create();
-  const publicClient = await viem.getPublicClient();
-
+describe("Counter", function () {
   it("Should emit the Increment event when calling the inc() function", async function () {
-    const counter = await viem.deployContract("Counter");
+    const { ethers } = await network.create();
+    const counter = await ethers.deployContract("Counter");
 
-    await viem.assertions.emitWithArgs(
-      counter.write.inc(),
-      counter,
-      "Increment",
-      [1n],
-    );
+    await expect(counter.inc())
+      .to.emit(counter, "Increment")
+      .withArgs(1n);
   });
 
   it("The sum of the Increment events should match the current value", async function () {
-    const counter = await viem.deployContract("Counter");
-    const deploymentBlockNumber = await publicClient.getBlockNumber();
+    const { ethers } = await network.create();
+    const counter = await ethers.deployContract("Counter");
 
-    // run a series of increments
-    for (let i = 1n; i <= 10n; i++) {
-      await counter.write.incBy([i]);
+    const deploymentBlockNumber = await ethers.provider.getBlockNumber();
+
+    for (let i = 1; i <= 10; i++) {
+      await counter.incBy(i);
     }
 
-    const events = await publicClient.getContractEvents({
-      address: counter.address,
-      abi: counter.abi,
-      eventName: "Increment",
-      fromBlock: deploymentBlockNumber,
-      strict: true,
-    });
+    const events = await counter.queryFilter(
+      counter.filters.Increment(),
+      deploymentBlockNumber,
+      "latest"
+    );
 
-    // check that the aggregated events match the current value
     let total = 0n;
     for (const event of events) {
       total += event.args.by;
     }
 
-    assert.equal(total, await counter.read.x());
+    expect(await counter.x()).to.equal(total);
   });
 });
