@@ -6,40 +6,31 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
-import {Lottery} from "./Lottery.sol";
+import {LotteryCore} from "./LotteryCore.sol";
 
 /// @title LotteryFactory
-/// @notice Deploys and tracks individual Lottery draw contracts for the
-///         btclottery.io platform. This contract is upgradeable (UUPS);
-///         individual Lottery instances it deploys are not.
-/// @dev Storage layout: only ever APPEND new state variables below the
-///      existing ones in future upgrades. Never reorder or remove.
-///      Note: ReentrancyGuard is intentionally omitted from this contract.
-///      The factory holds no funds and emits no external calls that could
-///      re-enter meaningfully. ReentrancyGuard is reserved for LotteryCore,
-///      which holds user funds and requires it unconditionally.
+/// @notice Deploys and tracks individual LotteryCore draw contracts.
+///         This contract is upgradeable (UUPS); individual draws are not.
+/// @dev Storage layout: only ever APPEND new state variables below existing
+///      ones in future upgrades. Never reorder or remove.
 contract LotteryFactory is
     Initializable,
     UUPSUpgradeable,
     AccessControlUpgradeable,
     PausableUpgradeable
 {
-    /// @notice Role permitted to create new lottery draws.
     bytes32 public constant LOTTERY_CREATOR_ROLE = keccak256("LOTTERY_CREATOR_ROLE");
-
-    /// @notice Role permitted to pause/unpause lottery creation.
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
-    /// @notice All deployed lottery addresses, in creation order.
     address[] private _lotteries;
-
-    /// @notice lotteryId => deployed Lottery contract address.
     mapping(uint256 => address) private _lotteryById;
 
-    /// @notice Emitted whenever a new Lottery draw contract is deployed.
-    /// @param lotteryId Sequential ID assigned to this lottery.
-    /// @param lotteryAddress Address of the newly deployed Lottery contract.
-    /// @param creator Address that triggered the creation.
+    /// @notice Default platform fee recipient — set at initialization.
+    address public defaultFeeRecipient;
+
+    /// @notice Default platform fee in basis points.
+    uint256 public defaultFeeBps;
+
     event LotteryCreated(
         uint256 indexed lotteryId,
         address indexed lotteryAddress,
@@ -51,10 +42,17 @@ contract LotteryFactory is
         _disableInitializers();
     }
 
-    /// @notice Initializes the factory. Replaces a constructor for upgradeable contracts.
-    /// @param admin Address granted DEFAULT_ADMIN_ROLE, LOTTERY_CREATOR_ROLE, and PAUSER_ROLE.
-    function initialize(address admin) public initializer {
+    /// @param admin            Address granted all roles.
+    /// @param _defaultFeeBps   Default platform fee in bps (e.g. 500 = 5%).
+    /// @param _feeRecipient    Default address receiving platform fees.
+    function initialize(
+        address admin,
+        uint256 _defaultFeeBps,
+        address _feeRecipient
+    ) public initializer {
         require(admin != address(0), "LotteryFactory: admin is zero address");
+        require(_feeRecipient != address(0), "LotteryFactory: fee recipient is zero address");
+        require(_defaultFeeBps <= 1000, "LotteryFactory: fee max 10%");
 
         __AccessControl_init();
         __Pausable_init();
@@ -62,11 +60,22 @@ contract LotteryFactory is
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(LOTTERY_CREATOR_ROLE, admin);
         _grantRole(PAUSER_ROLE, admin);
+
+        defaultFeeBps = _defaultFeeBps;
+        defaultFeeRecipient = _feeRecipient;
     }
 
-    /// @notice Deploys a new Lottery draw contract and registers it.
-    /// @return lotteryAddress The address of the newly deployed Lottery contract.
-    function createLottery()
+    /// @notice Deploys a new LotteryCore draw contract.
+    /// @param ticketPrice  Price per ticket in wei.
+    /// @param maxTickets   Hard cap on tickets.
+    /// @param minTickets   Minimum tickets for draw to proceed.
+    /// @param drawTime     Unix timestamp when sales close.
+    function createLottery(
+        uint256 ticketPrice,
+        uint256 maxTickets,
+        uint256 minTickets,
+        uint256 drawTime
+    )
         external
         onlyRole(LOTTERY_CREATOR_ROLE)
         whenNotPaused
@@ -74,45 +83,41 @@ contract LotteryFactory is
     {
         uint256 newId = _lotteries.length;
 
-        Lottery newLottery = new Lottery(address(this), newId);
-        lotteryAddress = address(newLottery);
+        LotteryCore newLottery = new LotteryCore(
+            address(this),
+            newId,
+            msg.sender,
+            ticketPrice,
+            maxTickets,
+            minTickets,
+            drawTime,
+            defaultFeeBps,
+            defaultFeeRecipient
+        );
 
+        lotteryAddress = address(newLottery);
         _lotteries.push(lotteryAddress);
         _lotteryById[newId] = lotteryAddress;
 
         emit LotteryCreated(newId, lotteryAddress, msg.sender);
     }
 
-    /// @notice Returns the total number of lotteries created.
     function getLotteryCount() external view returns (uint256) {
         return _lotteries.length;
     }
 
-    /// @notice Returns the address of a lottery by its sequential ID.
-    function getLottery(uint256 lotteryId) external view returns (address) {
-        return _lotteryById[lotteryId];
+    function getLottery(uint256 id) external view returns (address) {
+        return _lotteryById[id];
     }
 
-    /// @notice Returns all deployed lottery addresses.
-    /// @dev For large registries, prefer getLotteryCount + getLottery for pagination.
     function getAllLotteries() external view returns (address[] memory) {
         return _lotteries;
     }
 
-    /// @notice Pauses lottery creation. Does not affect existing Lottery contracts.
-    function pause() external onlyRole(PAUSER_ROLE) {
-        _pause();
-    }
+    function pause() external onlyRole(PAUSER_ROLE) { _pause(); }
+    function unpause() external onlyRole(PAUSER_ROLE) { _unpause(); }
 
-    /// @notice Unpauses lottery creation.
-    function unpause() external onlyRole(PAUSER_ROLE) {
-        _unpause();
-    }
-
-    /// @dev Restricts upgrade authorization to DEFAULT_ADMIN_ROLE.
-    ///      This is the single most security-critical function in this contract:
-    ///      anyone able to call this can replace the entire contract's logic.
-    function _authorizeUpgrade(address newImplementation)
+    function _authorizeUpgrade(address)
         internal
         override
         onlyRole(DEFAULT_ADMIN_ROLE)
