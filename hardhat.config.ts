@@ -8,10 +8,18 @@ export default defineConfig({
     profiles: {
       default: {
         version: "0.8.28",
+        settings: {
+          viaIR: true,
+          optimizer: {
+            enabled: true,
+            runs: 200,
+          },
+        },
       },
       production: {
         version: "0.8.28",
         settings: {
+          viaIR: true,
           optimizer: {
             enabled: true,
             runs: 200,
@@ -19,6 +27,9 @@ export default defineConfig({
         },
       },
     },
+    npmFilesToBuild: [
+      "@chainlink/contracts/src/v0.8/vrf/mocks/VRFCoordinatorV2_5Mock.sol",
+    ],
   },
   networks: {
     hardhatMainnet: {

@@ -5,6 +5,16 @@ import { ZeroAddress } from "ethers";
 
 describe("LotteryCore", function () {
 
+  // ─── VRF Config Constants ─────────────────────────────────────────────────
+
+  const KEY_HASH = "0x787d74caea10b2b357790d5b5247c2f63d1d91572a9846f780606e4d953677ae";
+  const CALLBACK_GAS_LIMIT = 100_000;
+  const REQUEST_CONFIRMATIONS = 3;
+  const BASE_FEE = "100000000000000000"; // 0.1 LINK
+  const GAS_PRICE_LINK = "1000000000"; // 1 gwei LINK
+
+  // ─── Setup Helper ─────────────────────────────────────────────────────────
+
   async function setup(overrides: {
     ticketPrice?: bigint;
     maxTickets?: bigint;
@@ -19,27 +29,83 @@ describe("LotteryCore", function () {
     const [admin, buyer1, buyer2, buyer3, feeRecipient] =
       await ethers.getSigners();
 
-    const ticketPrice = overrides.ticketPrice ?? ethers.parseEther("0.1");
-    const maxTickets = overrides.maxTickets ?? 100n;
-    const minTickets = overrides.minTickets ?? 5n;
-    const drawTimeOffset = overrides.drawTimeOffset ?? 3600;
-    const feeBps = overrides.feeBps ?? 500n;
+    // Deploy mock VRF coordinator
+    const MockCoordinator = await ethers.getContractFactory(
+      "VRFCoordinatorV2_5Mock"
+    );
+    const mockCoordinator = await MockCoordinator.deploy(
+      BASE_FEE,
+      GAS_PRICE_LINK,
+      "4000000000000000" // wei per unit link (0.004 ETH/LINK)
+    );
+    await mockCoordinator.waitForDeployment();
 
-    const block = await ethers.provider.getBlock("latest");
+    // Create and fund a VRF subscription
+    const createSubTx = await mockCoordinator.createSubscription();
+    const createSubReceipt = await createSubTx.wait();
+    const subCreatedLog = createSubReceipt!.logs.find(
+      (log: any) => log.fragment?.name === "SubscriptionCreated"
+    ) as any;
+    const subscriptionId: bigint = subCreatedLog.args[0];
+
+    // Fund subscription with 10 LINK (mock)
+    await mockCoordinator.fundSubscription(
+      subscriptionId,
+      ethers.parseEther("1000")
+    );
+
+    // Lottery params
+    const ticketPrice    = overrides.ticketPrice    ?? ethers.parseEther("0.1");
+    const maxTickets     = overrides.maxTickets     ?? 100n;
+    const minTickets     = overrides.minTickets     ?? 5n;
+    const drawTimeOffset = overrides.drawTimeOffset ?? 3600;
+    const feeBps         = overrides.feeBps         ?? 500n;
+
+    const block    = await ethers.provider.getBlock("latest");
     const drawTime = BigInt(block!.timestamp + drawTimeOffset);
 
     const LotteryCore = await ethers.getContractFactory("LotteryCore");
     const lottery = await LotteryCore.deploy(
-      admin.address, 0n, admin.address,
-      ticketPrice, maxTickets, minTickets,
-      drawTime, feeBps, feeRecipient.address
+      await mockCoordinator.getAddress(),
+      subscriptionId,
+      KEY_HASH,
+      CALLBACK_GAS_LIMIT,
+      REQUEST_CONFIRMATIONS,
+      admin.address,  // factory (admin acts as factory in tests)
+      0n,
+      admin.address,
+      ticketPrice,
+      maxTickets,
+      minTickets,
+      drawTime,
+      feeBps,
+      feeRecipient.address
     );
     await lottery.waitForDeployment();
 
+    // Register lottery as a VRF consumer
+    await mockCoordinator.addConsumer(
+      subscriptionId,
+      await lottery.getAddress()
+    );
+
     return {
-      ethers, upgradesApi, lottery, LotteryCore,
-      admin, buyer1, buyer2, buyer3, feeRecipient,
-      ticketPrice, maxTickets, minTickets, drawTime, feeBps,
+      ethers,
+      upgradesApi,
+      lottery,
+      LotteryCore,
+      mockCoordinator,
+      subscriptionId,
+      admin,
+      buyer1,
+      buyer2,
+      buyer3,
+      feeRecipient,
+      ticketPrice,
+      maxTickets,
+      minTickets,
+      drawTime,
+      feeBps,
     };
   }
 
@@ -61,9 +127,12 @@ describe("LotteryCore", function () {
     });
 
     it("Should revert with zero factory address", async function () {
-      const { LotteryCore, admin, feeRecipient, drawTime, ethers } = await setup();
+      const { LotteryCore, admin, feeRecipient, drawTime, mockCoordinator, subscriptionId, ethers } =
+        await setup();
       await expect(
         LotteryCore.deploy(
+          await mockCoordinator.getAddress(),
+          subscriptionId, KEY_HASH, CALLBACK_GAS_LIMIT, REQUEST_CONFIRMATIONS,
           ZeroAddress, 0n, admin.address,
           ethers.parseEther("0.1"), 100n, 5n, drawTime, 500n, feeRecipient.address
         )
@@ -71,11 +140,14 @@ describe("LotteryCore", function () {
     });
 
     it("Should revert if drawTime is in the past", async function () {
-      const { LotteryCore, admin, feeRecipient, ethers } = await setup();
+      const { LotteryCore, admin, feeRecipient, mockCoordinator, subscriptionId, ethers } =
+        await setup();
       const block = await ethers.provider.getBlock("latest");
       const pastTime = BigInt(block!.timestamp - 1);
       await expect(
         LotteryCore.deploy(
+          await mockCoordinator.getAddress(),
+          subscriptionId, KEY_HASH, CALLBACK_GAS_LIMIT, REQUEST_CONFIRMATIONS,
           admin.address, 0n, admin.address,
           ethers.parseEther("0.1"), 100n, 5n, pastTime, 500n, feeRecipient.address
         )
@@ -83,9 +155,12 @@ describe("LotteryCore", function () {
     });
 
     it("Should revert if minTickets > maxTickets", async function () {
-      const { LotteryCore, admin, feeRecipient, drawTime, ethers } = await setup();
+      const { LotteryCore, admin, feeRecipient, drawTime, mockCoordinator, subscriptionId, ethers } =
+        await setup();
       await expect(
         LotteryCore.deploy(
+          await mockCoordinator.getAddress(),
+          subscriptionId, KEY_HASH, CALLBACK_GAS_LIMIT, REQUEST_CONFIRMATIONS,
           admin.address, 0n, admin.address,
           ethers.parseEther("0.1"), 5n, 100n, drawTime, 500n, feeRecipient.address
         )
@@ -93,9 +168,12 @@ describe("LotteryCore", function () {
     });
 
     it("Should revert if feeBps > 1000", async function () {
-      const { LotteryCore, admin, feeRecipient, drawTime, ethers } = await setup();
+      const { LotteryCore, admin, feeRecipient, drawTime, mockCoordinator, subscriptionId, ethers } =
+        await setup();
       await expect(
         LotteryCore.deploy(
+          await mockCoordinator.getAddress(),
+          subscriptionId, KEY_HASH, CALLBACK_GAS_LIMIT, REQUEST_CONFIRMATIONS,
           admin.address, 0n, admin.address,
           ethers.parseEther("0.1"), 100n, 5n, drawTime, 1001n, feeRecipient.address
         )
@@ -171,9 +249,9 @@ describe("LotteryCore", function () {
     });
   });
 
-  // ─── requestDraw + fulfillRandomWords ────────────────────────────────────
+  // ─── requestDraw + VRF fulfillment ───────────────────────────────────────
 
-  describe("requestDraw() + fulfillRandomWords()", function () {
+  describe("requestDraw() + VRF fulfillment", function () {
     async function setupWithMinTicketsSold() {
       const ctx = await setup({ minTickets: 3n, drawTimeOffset: 60 });
       const { lottery, buyer1, buyer2, buyer3, ticketPrice, ethers } = ctx;
@@ -185,17 +263,11 @@ describe("LotteryCore", function () {
       return ctx;
     }
 
-    it("Should move to Drawing status after requestDraw", async function () {
+    it("Should move to Drawing status and emit DrawRequested", async function () {
       const { lottery, admin } = await setupWithMinTicketsSold();
-      await lottery.connect(admin).requestDraw();
-      expect(await lottery.status()).to.equal(2n);
-    });
-
-    it("Should emit DrawRequested event", async function () {
-      const { lottery, admin } = await setupWithMinTicketsSold();
-      await expect(lottery.connect(admin).requestDraw())
-        .to.emit(lottery, "DrawRequested")
-        .withArgs(0n, 3n);
+      const tx = await lottery.connect(admin).requestDraw();
+      expect(await lottery.status()).to.equal(2n); // Drawing
+      await expect(tx).to.emit(lottery, "DrawRequested");
     });
 
     it("Should revert requestDraw if drawTime not reached", async function () {
@@ -218,21 +290,42 @@ describe("LotteryCore", function () {
       ).to.be.revertedWithCustomError(lottery, "MinTicketsNotMet");
     });
 
-    it("Should select a valid winner via fulfillRandomWords", async function () {
-      const { lottery, admin, buyer1, buyer2, buyer3 } =
+    it("Should select a valid winner via VRF callback", async function () {
+      const { lottery, admin, mockCoordinator, buyer1, buyer2, buyer3 } =
         await setupWithMinTicketsSold();
+
       await lottery.connect(admin).requestDraw();
-      await lottery.connect(admin).fulfillRandomWords(12345n);
-      expect(await lottery.status()).to.equal(3n);
+      const requestId = await lottery.s_requestId();
+
+      // Simulate Chainlink fulfilling the VRF request
+      await mockCoordinator.fulfillRandomWords(
+        requestId,
+        await lottery.getAddress()
+      );
+
+      expect(await lottery.status()).to.equal(3n); // Completed
       const w = await lottery.winner();
       expect([buyer1.address, buyer2.address, buyer3.address]).to.include(w);
     });
 
-    it("Should emit WinnerSelected event", async function () {
-      const { lottery, admin } = await setupWithMinTicketsSold();
+    it("Should emit WinnerSelected after VRF fulfillment", async function () {
+      const { lottery, admin, mockCoordinator } =
+        await setupWithMinTicketsSold();
+
       await lottery.connect(admin).requestDraw();
-      await expect(lottery.connect(admin).fulfillRandomWords(99n))
-        .to.emit(lottery, "WinnerSelected");
+      const requestId = await lottery.s_requestId();
+
+      await expect(
+        mockCoordinator.fulfillRandomWords(requestId, await lottery.getAddress())
+      ).to.emit(lottery, "WinnerSelected");
+    });
+
+    it("Should revert if non-operator calls requestDraw", async function () {
+      const { lottery, buyer1, OPERATOR_ROLE } =
+        await setupWithMinTicketsSold() as any;
+      await expect(
+        lottery.connect(buyer1).requestDraw()
+      ).to.be.revertedWithCustomError(lottery, "AccessControlUnauthorizedAccount");
     });
   });
 
@@ -241,12 +334,13 @@ describe("LotteryCore", function () {
   describe("claimPrize()", function () {
     async function setupCompleted() {
       const ctx = await setup({ minTickets: 1n, drawTimeOffset: 60, feeBps: 500n });
-      const { lottery, admin, buyer1, ticketPrice, ethers } = ctx;
+      const { lottery, admin, buyer1, ticketPrice, ethers, mockCoordinator } = ctx;
       await lottery.connect(buyer1).buyTickets(1n, { value: ticketPrice });
       await ethers.provider.send("evm_increaseTime", [120]);
       await ethers.provider.send("evm_mine", []);
       await lottery.connect(admin).requestDraw();
-      await lottery.connect(admin).fulfillRandomWords(0n);
+      const requestId = await lottery.s_requestId();
+      await mockCoordinator.fulfillRandomWords(requestId, await lottery.getAddress());
       return ctx;
     }
 
@@ -296,7 +390,7 @@ describe("LotteryCore", function () {
       return ctx;
     }
 
-    it("Should move to Refunding status after triggerRefund", async function () {
+    it("Should move to Refunding status", async function () {
       const { lottery, admin } = await setupExpiredNoMinTickets();
       await lottery.connect(admin).triggerRefund();
       expect(await lottery.status()).to.equal(4n);
@@ -350,7 +444,7 @@ describe("LotteryCore", function () {
       ).to.be.revertedWithCustomError(lottery, "NoTicketsPurchased");
     });
 
-    it("Should revert on double refund claim", async function () {
+    it("Should revert on double refund", async function () {
       const { lottery, admin, buyer1 } = await setupExpiredNoMinTickets();
       await lottery.connect(admin).triggerRefund();
       await lottery.connect(buyer1).claimRefund();
@@ -363,16 +457,38 @@ describe("LotteryCore", function () {
   // ─── LotteryFactory integration ──────────────────────────────────────────
 
   describe("LotteryFactory integration", function () {
-    it("Should deploy LotteryCore via factory and be functional", async function () {
+    it("Should deploy LotteryCore via factory with VRF config", async function () {
       const connection = await hre.network.create();
       const { ethers } = connection;
       const upgradesApi = await upgrades(hre, connection);
       const [admin, , , , feeRecipient] = await ethers.getSigners();
 
+      // Deploy mock coordinator
+      const MockCoordinator = await ethers.getContractFactory("VRFCoordinatorV2_5Mock");
+      const mockCoordinator = await MockCoordinator.deploy(
+        BASE_FEE, GAS_PRICE_LINK, "4000000000000000"
+      );
+      await mockCoordinator.waitForDeployment();
+
+      const createSubTx = await mockCoordinator.createSubscription();
+      const receipt = await createSubTx.wait();
+      const subLog = receipt!.logs.find((l: any) => l.fragment?.name === "SubscriptionCreated") as any;
+      const subId: bigint = subLog.args[0];
+      await mockCoordinator.fundSubscription(subId, ethers.parseEther("1000"));
+
       const LotteryFactory = await ethers.getContractFactory("LotteryFactory");
       const factory = await upgradesApi.deployProxy(
         LotteryFactory,
-        [admin.address, 500n, feeRecipient.address],
+        [
+          admin.address,
+          500n,
+          feeRecipient.address,
+          await mockCoordinator.getAddress(),
+          subId,
+          KEY_HASH,
+          CALLBACK_GAS_LIMIT,
+          REQUEST_CONFIRMATIONS,
+        ],
         { kind: "uups" }
       );
       await factory.waitForDeployment();

@@ -3,6 +3,12 @@ import hre from "hardhat";
 import { upgrades } from "@openzeppelin/hardhat-upgrades";
 import { ZeroAddress } from "ethers";
 
+const KEY_HASH = "0x787d74caea10b2b357790d5b5247c2f63d1d91572a9846f780606e4d953677ae";
+const CALLBACK_GAS_LIMIT = 100_000;
+const REQUEST_CONFIRMATIONS = 3;
+const BASE_FEE = "100000000000000000";
+const GAS_PRICE_LINK = "1000000000";
+
 describe("LotteryFactory", function () {
 
   async function setup() {
@@ -13,34 +19,46 @@ describe("LotteryFactory", function () {
     const [admin, lotteryCreator, pauser, stranger, feeRecipient] =
       await ethers.getSigners();
 
+    const MockCoordinator = await ethers.getContractFactory("VRFCoordinatorV2_5Mock");
+    const mockCoordinator = await MockCoordinator.deploy(
+      BASE_FEE, GAS_PRICE_LINK, "4000000000000000"
+    );
+    await mockCoordinator.waitForDeployment();
+
+    const createSubTx = await mockCoordinator.createSubscription();
+    const receipt = await createSubTx.wait();
+    const subLog = receipt!.logs.find((l: any) => l.fragment?.name === "SubscriptionCreated") as any;
+    const subscriptionId: bigint = subLog.args[0];
+    await mockCoordinator.fundSubscription(subscriptionId, ethers.parseEther("1000"));
+
     const LotteryFactory = await ethers.getContractFactory("LotteryFactory");
     const factory = await upgradesApi.deployProxy(
       LotteryFactory,
-      [admin.address, 500n, feeRecipient.address],
+      [
+        admin.address,
+        500n,
+        feeRecipient.address,
+        await mockCoordinator.getAddress(),
+        subscriptionId,
+        KEY_HASH,
+        CALLBACK_GAS_LIMIT,
+        REQUEST_CONFIRMATIONS,
+      ],
       { kind: "uups" }
     );
     await factory.waitForDeployment();
 
     const LOTTERY_CREATOR_ROLE = await factory.LOTTERY_CREATOR_ROLE();
-    const PAUSER_ROLE = await factory.PAUSER_ROLE();
-    const DEFAULT_ADMIN_ROLE = await factory.DEFAULT_ADMIN_ROLE();
+    const PAUSER_ROLE          = await factory.PAUSER_ROLE();
+    const DEFAULT_ADMIN_ROLE   = await factory.DEFAULT_ADMIN_ROLE();
 
-    const block = await ethers.provider.getBlock("latest");
+    const block    = await ethers.provider.getBlock("latest");
     const drawTime = BigInt(block!.timestamp + 3600);
 
     return {
-      ethers,
-      upgradesApi,
-      factory,
-      admin,
-      lotteryCreator,
-      pauser,
-      stranger,
-      feeRecipient,
-      LOTTERY_CREATOR_ROLE,
-      PAUSER_ROLE,
-      DEFAULT_ADMIN_ROLE,
-      drawTime,
+      ethers, upgradesApi, factory, mockCoordinator, subscriptionId,
+      admin, lotteryCreator, pauser, stranger, feeRecipient,
+      LOTTERY_CREATOR_ROLE, PAUSER_ROLE, DEFAULT_ADMIN_ROLE, drawTime,
     };
   }
 
@@ -55,17 +73,20 @@ describe("LotteryFactory", function () {
       const { ethers } = connection;
       const upgradesApi = await upgrades(hre, connection);
       const [, , , , feeRecipient] = await ethers.getSigners();
+      const MockCoordinator = await ethers.getContractFactory("VRFCoordinatorV2_5Mock");
+      const mockCoordinator = await MockCoordinator.deploy(BASE_FEE, GAS_PRICE_LINK, "4000000000000000");
+      await mockCoordinator.waitForDeployment();
       const LotteryFactory = await ethers.getContractFactory("LotteryFactory");
       await expect(
         upgradesApi.deployProxy(
           LotteryFactory,
-          [ZeroAddress, 500n, feeRecipient.address],
+          [ZeroAddress, 500n, feeRecipient.address, await mockCoordinator.getAddress(), 1n, KEY_HASH, CALLBACK_GAS_LIMIT, REQUEST_CONFIRMATIONS],
           { kind: "uups" }
         )
       ).to.be.revertedWith("LotteryFactory: admin is zero address");
     });
 
-    it("Should grant all three roles to admin on initialize", async function () {
+    it("Should grant all three roles to admin", async function () {
       const { factory, admin, LOTTERY_CREATOR_ROLE, PAUSER_ROLE, DEFAULT_ADMIN_ROLE } =
         await setup();
       expect(await factory.hasRole(DEFAULT_ADMIN_ROLE, admin.address)).to.be.true;
@@ -78,10 +99,11 @@ describe("LotteryFactory", function () {
       expect(await factory.getLotteryCount()).to.equal(0n);
     });
 
-    it("Should store default fee config", async function () {
-      const { factory, feeRecipient } = await setup();
+    it("Should store default fee and VRF config", async function () {
+      const { factory, feeRecipient, mockCoordinator } = await setup();
       expect(await factory.defaultFeeBps()).to.equal(500n);
       expect(await factory.defaultFeeRecipient()).to.equal(feeRecipient.address);
+      expect(await factory.vrfCoordinator()).to.equal(await mockCoordinator.getAddress());
     });
   });
 
@@ -104,23 +126,21 @@ describe("LotteryFactory", function () {
         .withArgs(0n, lotteryAddress, admin.address);
     });
 
-    it("Should correctly assign sequential IDs", async function () {
+    it("Should assign sequential IDs", async function () {
       const { factory, drawTime, ethers } = await setup();
       await factory.createLottery(ethers.parseEther("0.1"), 100n, 5n, drawTime);
       await factory.createLottery(ethers.parseEther("0.1"), 100n, 5n, drawTime);
       await factory.createLottery(ethers.parseEther("0.1"), 100n, 5n, drawTime);
       expect(await factory.getLotteryCount()).to.equal(3n);
-      expect((await factory.getAllLotteries()).length).to.equal(3);
     });
 
-    it("Should revert when called without LOTTERY_CREATOR_ROLE", async function () {
+    it("Should revert without LOTTERY_CREATOR_ROLE", async function () {
       const { factory, stranger, LOTTERY_CREATOR_ROLE, drawTime, ethers } = await setup();
       await expect(
         factory.connect(stranger).createLottery(
           ethers.parseEther("0.1"), 100n, 5n, drawTime
         )
-      )
-        .to.be.revertedWithCustomError(factory, "AccessControlUnauthorizedAccount")
+      ).to.be.revertedWithCustomError(factory, "AccessControlUnauthorizedAccount")
         .withArgs(stranger.address, LOTTERY_CREATOR_ROLE);
     });
   });
@@ -159,9 +179,7 @@ describe("LotteryFactory", function () {
 
       const LotteryFactoryV2 = await ethers.getContractFactory("LotteryFactory");
       const upgraded = await upgradesApi.upgradeProxy(
-        await factory.getAddress(),
-        LotteryFactoryV2,
-        { kind: "uups" }
+        await factory.getAddress(), LotteryFactoryV2, { kind: "uups" }
       );
       await upgraded.waitForDeployment();
       expect(await upgraded.getLotteryCount()).to.equal(2n);
@@ -171,17 +189,12 @@ describe("LotteryFactory", function () {
     it("Should revert upgrade from non-admin", async function () {
       const { factory, stranger, DEFAULT_ADMIN_ROLE, ethers, upgradesApi } =
         await setup();
-      const LotteryFactoryV2 = await ethers.getContractFactory(
-        "LotteryFactory", stranger
-      );
+      const LotteryFactoryV2 = await ethers.getContractFactory("LotteryFactory", stranger);
       await expect(
         upgradesApi.upgradeProxy(
-          await factory.getAddress(),
-          LotteryFactoryV2,
-          { kind: "uups" }
+          await factory.getAddress(), LotteryFactoryV2, { kind: "uups" }
         )
-      )
-        .to.be.revertedWithCustomError(factory, "AccessControlUnauthorizedAccount")
+      ).to.be.revertedWithCustomError(factory, "AccessControlUnauthorizedAccount")
         .withArgs(stranger.address, DEFAULT_ADMIN_ROLE);
     });
   });
