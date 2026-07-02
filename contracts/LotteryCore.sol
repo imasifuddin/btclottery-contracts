@@ -7,14 +7,16 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+import {PrizeSchemeRegistry} from "./PrizeSchemeRegistry.sol";
+
 /// @title LotteryCore
 /// @notice A single lottery draw instance deployed by LotteryFactory.
-///         Handles ticket sales (native token), prize pool accumulation,
-///         Chainlink VRF V2.5 provably-fair winner selection, prize payout,
-///         and refunds if minimum tickets are not met.
-/// @dev NOT upgradeable — individual draws are short-lived.
-///      Uses CEI (Checks-Effects-Interactions) pattern on all fund movements.
-///      ReentrancyGuard is unconditional since this contract holds user funds.
+///         Supports multi-tier prize distribution via a referenced
+///         PrizeSchemeRegistry scheme. Handles ticket sales, prize pool
+///         accumulation, Chainlink VRF V2.5 multi-winner selection,
+///         per-rank prize claims, and refunds if minTickets not met.
+/// @dev NOT upgradeable. CEI pattern on all fund movements. ReentrancyGuard
+///      unconditional since this contract holds user funds.
 contract LotteryCore is
     VRFConsumerBaseV2Plus,
     ReentrancyGuard,
@@ -26,32 +28,30 @@ contract LotteryCore is
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     bytes32 public constant PAUSER_ROLE   = keccak256("PAUSER_ROLE");
 
-    // ─── Lottery Status ──────────────────────────────────────────────────────
+    // ─── Status ──────────────────────────────────────────────────────────────
 
-    enum LotteryStatus {
-        Created,    // Not used — deploy goes straight to Open
-        Open,       // Ticket sales active
-        Drawing,    // VRF request sent, awaiting callback
-        Completed,  // Winner selected, prize claimable
-        Refunding   // Min tickets not met, refunds active
-    }
+    enum LotteryStatus { Created, Open, Drawing, Completed, Refunding }
 
     // ─── VRF Config ──────────────────────────────────────────────────────────
 
-    /// @notice Chainlink VRF subscription ID.
     uint256 public immutable subscriptionId;
-
-    /// @notice VRF key hash (gas lane) for the target network.
     bytes32 public immutable keyHash;
-
-    /// @notice Gas limit for the VRF fulfillment callback.
-    uint32 public immutable callbackGasLimit;
-
-    /// @notice Number of block confirmations before VRF response is accepted.
-    uint16 public immutable requestConfirmations;
-
-    /// @notice VRF request ID, set when requestDraw() is called.
+    uint32  public immutable callbackGasLimit;
+    uint16  public immutable requestConfirmations;
     uint256 public s_requestId;
+
+    // ─── Prize Scheme ────────────────────────────────────────────────────────
+
+    /// @notice Registry holding the reusable prize scheme this draw uses.
+    PrizeSchemeRegistry public immutable prizeSchemeRegistry;
+
+    /// @notice ID of the prize scheme in the registry this draw references.
+    uint256 public immutable schemeId;
+
+    /// @notice Number of prize tiers (ranks) this draw pays out — snapshot
+    ///         from the scheme at draw creation, so later scheme edits
+    ///         (via deactivation + new scheme) never affect this draw.
+    uint256 public immutable tierCount;
 
     // ─── Lottery State ───────────────────────────────────────────────────────
 
@@ -65,22 +65,25 @@ contract LotteryCore is
     uint256 public ticketsSold;
     uint256 public prizePool;
     uint256 public drawTime;
-    uint256 public feeBps;
     address public feeRecipient;
-    address public winner;
+
+    /// @notice rank (0-indexed) => winning address. rank 0 = top prize.
+    mapping(uint256 => address) public winners;
+
+    /// @notice rank => whether that rank's prize has been claimed.
+    mapping(uint256 => bool) public rankClaimed;
 
     mapping(address => uint256) public ticketsBought;
     address[] private _buyers;
     mapping(address => bool) public refundClaimed;
-    bool public prizeClaimed;
 
     // ─── Events ──────────────────────────────────────────────────────────────
 
     event LotteryOpened(uint256 indexed lotteryId, uint256 drawTime, uint256 ticketPrice);
     event TicketsPurchased(uint256 indexed lotteryId, address indexed buyer, uint256 count, uint256 totalPaid);
     event DrawRequested(uint256 indexed lotteryId, uint256 requestId, uint256 ticketsSold);
-    event WinnerSelected(uint256 indexed lotteryId, address indexed winner, uint256 prize);
-    event PrizeClaimed(uint256 indexed lotteryId, address indexed winner, uint256 amount);
+    event WinnerSelected(uint256 indexed lotteryId, uint256 indexed rank, address indexed winner, uint256 prize);
+    event PrizeClaimed(uint256 indexed lotteryId, uint256 indexed rank, address indexed winner, uint256 amount);
     event RefundTriggered(uint256 indexed lotteryId, uint256 ticketsSold);
     event RefundClaimed(uint256 indexed lotteryId, address indexed buyer, uint256 amount);
 
@@ -101,88 +104,88 @@ contract LotteryCore is
     error InvalidParam(string reason);
     error TransferFailed();
     error InvalidVRFRequest();
+    error InvalidRank();
+    error SchemeInactiveAtCreation();
 
     // ─── Constructor ─────────────────────────────────────────────────────────
 
-    /// @param _vrfCoordinator   Chainlink VRF Coordinator address for this network.
-    /// @param _subscriptionId   Chainlink VRF subscription ID (must be funded with LINK).
-    /// @param _keyHash          VRF key hash / gas lane for the target network.
-    /// @param _callbackGasLimit Gas limit for the VRF fulfillRandomWords callback.
-    /// @param _requestConfirmations Block confirmations before VRF response is valid.
-    /// @param _factory          LotteryFactory address that deployed this instance.
-    /// @param _lotteryId        Sequential ID assigned by the factory.
-    /// @param _admin            Address granted admin + operator + pauser roles.
-    /// @param _ticketPrice      Price per ticket in wei (native token).
-    /// @param _maxTickets       Hard cap on tickets sold.
-    /// @param _minTickets       Minimum tickets required for draw to proceed.
-    /// @param _drawTime         Unix timestamp when ticket sales close.
-    /// @param _feeBps           Platform fee in basis points (max 1000 = 10%).
-    /// @param _feeRecipient     Address receiving the platform fee.
-    constructor(
-        address _vrfCoordinator,
-        uint256 _subscriptionId,
-        bytes32 _keyHash,
-        uint32  _callbackGasLimit,
-        uint16  _requestConfirmations,
-        address _factory,
-        uint256 _lotteryId,
-        address _admin,
-        uint256 _ticketPrice,
-        uint256 _maxTickets,
-        uint256 _minTickets,
-        uint256 _drawTime,
-        uint256 _feeBps,
-        address _feeRecipient
-    )
-        VRFConsumerBaseV2Plus(_vrfCoordinator)
+    struct VRFConfig {
+        address vrfCoordinator;
+        uint256 subscriptionId;
+        bytes32 keyHash;
+        uint32  callbackGasLimit;
+        uint16  requestConfirmations;
+    }
+
+    struct DrawConfig {
+        address factory;
+        uint256 lotteryId;
+        address admin;
+        uint256 ticketPrice;
+        uint256 maxTickets;
+        uint256 minTickets;
+        uint256 drawTime;
+        address feeRecipient;
+        address prizeSchemeRegistry;
+        uint256 schemeId;
+    }
+
+    constructor(VRFConfig memory vrf, DrawConfig memory draw)
+        VRFConsumerBaseV2Plus(vrf.vrfCoordinator)
     {
-        if (_factory == address(0))      revert ZeroAddress();
-        if (_admin == address(0))        revert ZeroAddress();
-        if (_feeRecipient == address(0)) revert ZeroAddress();
-        if (_ticketPrice == 0)           revert InvalidParam("ticketPrice must be > 0");
-        if (_maxTickets == 0)            revert InvalidParam("maxTickets must be > 0");
-        if (_minTickets == 0)            revert InvalidParam("minTickets must be > 0");
-        if (_minTickets > _maxTickets)   revert InvalidParam("minTickets > maxTickets");
-        if (_drawTime <= block.timestamp) revert InvalidParam("drawTime must be in future");
-        if (_feeBps > 1000)              revert InvalidParam("feeBps max 10%");
-        if (_callbackGasLimit == 0)      revert InvalidParam("callbackGasLimit must be > 0");
+        if (draw.factory == address(0))      revert ZeroAddress();
+        if (draw.admin == address(0))        revert ZeroAddress();
+        if (draw.feeRecipient == address(0)) revert ZeroAddress();
+        if (draw.prizeSchemeRegistry == address(0)) revert ZeroAddress();
+        if (draw.ticketPrice == 0)           revert InvalidParam("ticketPrice must be > 0");
+        if (draw.maxTickets == 0)            revert InvalidParam("maxTickets must be > 0");
+        if (draw.minTickets == 0)            revert InvalidParam("minTickets must be > 0");
+        if (draw.minTickets > draw.maxTickets) revert InvalidParam("minTickets > maxTickets");
+        if (draw.drawTime <= block.timestamp) revert InvalidParam("drawTime must be in future");
+        if (vrf.callbackGasLimit == 0)       revert InvalidParam("callbackGasLimit must be > 0");
 
-        subscriptionId      = _subscriptionId;
-        keyHash             = _keyHash;
-        callbackGasLimit    = _callbackGasLimit;
-        requestConfirmations = _requestConfirmations;
+        PrizeSchemeRegistry registry = PrizeSchemeRegistry(draw.prizeSchemeRegistry);
+        if (!registry.isSchemeActive(draw.schemeId)) revert SchemeInactiveAtCreation();
 
-        factory      = _factory;
-        lotteryId    = _lotteryId;
-        ticketPrice  = _ticketPrice;
-        maxTickets   = _maxTickets;
-        minTickets   = _minTickets;
-        drawTime     = _drawTime;
-        feeBps       = _feeBps;
-        feeRecipient = _feeRecipient;
+        subscriptionId        = vrf.subscriptionId;
+        keyHash                = vrf.keyHash;
+        callbackGasLimit       = vrf.callbackGasLimit;
+        requestConfirmations   = vrf.requestConfirmations;
 
-        _grantRole(DEFAULT_ADMIN_ROLE, _admin);
-        _grantRole(OPERATOR_ROLE, _admin);
-        _grantRole(PAUSER_ROLE, _admin);
+        factory       = draw.factory;
+        lotteryId     = draw.lotteryId;
+        ticketPrice   = draw.ticketPrice;
+        maxTickets    = draw.maxTickets;
+        minTickets    = draw.minTickets;
+        drawTime      = draw.drawTime;
+        feeRecipient  = draw.feeRecipient;
+
+        prizeSchemeRegistry = registry;
+        schemeId            = draw.schemeId;
+        tierCount           = registry.getTierCount(draw.schemeId);
+
+        _grantRole(DEFAULT_ADMIN_ROLE, draw.admin);
+        _grantRole(OPERATOR_ROLE, draw.admin);
+        _grantRole(PAUSER_ROLE, draw.admin);
 
         status = LotteryStatus.Open;
-        emit LotteryOpened(_lotteryId, _drawTime, _ticketPrice);
+        emit LotteryOpened(draw.lotteryId, draw.drawTime, draw.ticketPrice);
     }
+
 
     // ─── Ticket Purchase ─────────────────────────────────────────────────────
 
-    /// @notice Purchase one or more tickets with native token.
     function buyTickets(uint256 count)
         external
         payable
         whenNotPaused
         nonReentrant
     {
-        if (status != LotteryStatus.Open)          revert NotOpen();
-        if (block.timestamp >= drawTime)           revert DrawTimeAlreadyPassed();
-        if (count == 0)                            revert InvalidParam("count must be > 0");
-        if (ticketsSold + count > maxTickets)      revert SoldOut();
-        if (msg.value != ticketPrice * count)      revert IncorrectPayment();
+        if (status != LotteryStatus.Open)      revert NotOpen();
+        if (block.timestamp >= drawTime)       revert DrawTimeAlreadyPassed();
+        if (count == 0)                        revert InvalidParam("count must be > 0");
+        if (ticketsSold + count > maxTickets)  revert SoldOut();
+        if (msg.value != ticketPrice * count)  revert IncorrectPayment();
 
         if (ticketsBought[msg.sender] == 0) {
             _buyers.push(msg.sender);
@@ -196,27 +199,27 @@ contract LotteryCore is
 
     // ─── Draw ────────────────────────────────────────────────────────────────
 
-    /// @notice Request a provably-fair winner draw via Chainlink VRF V2.5.
-    ///         Callable only after drawTime if minTickets have been sold.
+    /// @notice Request winner selection via Chainlink VRF. Requests `tierCount`
+    ///         random words in one call — one per prize rank.
     function requestDraw()
         external
         onlyRole(OPERATOR_ROLE)
         nonReentrant
     {
-        if (status != LotteryStatus.Open)      revert NotOpen();
-        if (block.timestamp < drawTime)        revert DrawTimeNotReached();
-        if (ticketsSold < minTickets)          revert MinTicketsNotMet();
+        if (status != LotteryStatus.Open)  revert NotOpen();
+        if (block.timestamp < drawTime)    revert DrawTimeNotReached();
+        if (ticketsSold < minTickets)      revert MinTicketsNotMet();
 
         status = LotteryStatus.Drawing;
 
         s_requestId = s_vrfCoordinator.requestRandomWords(
             VRFV2PlusClient.RandomWordsRequest({
-                keyHash:             keyHash,
-                subId:               subscriptionId,
+                keyHash:              keyHash,
+                subId:                subscriptionId,
                 requestConfirmations: requestConfirmations,
-                callbackGasLimit:    callbackGasLimit,
-                numWords:            1,
-                extraArgs:           VRFV2PlusClient._argsToBytes(
+                callbackGasLimit:     callbackGasLimit,
+                numWords:             uint32(tierCount),
+                extraArgs:            VRFV2PlusClient._argsToBytes(
                     VRFV2PlusClient.ExtraArgsV1({ nativePayment: false })
                 )
             })
@@ -225,38 +228,59 @@ contract LotteryCore is
         emit DrawRequested(lotteryId, s_requestId, ticketsSold);
     }
 
-    /// @notice Chainlink VRF V2.5 callback — called by the VRF Coordinator only.
-    /// @dev    SECURITY: VRFConsumerBaseV2Plus enforces that only the coordinator
-    ///         can call this via rawFulfillRandomWords(). Do not add access modifiers.
+    /// @notice Chainlink VRF callback. Selects `tierCount` distinct winners
+    ///         using sequential remove-after-pick weighted selection so no
+    ///         address can win more than one rank.
     function fulfillRandomWords(
         uint256 requestId,
         uint256[] calldata randomWords
     ) internal override {
-        if (requestId != s_requestId)          revert InvalidVRFRequest();
-        if (status != LotteryStatus.Drawing)   revert NotOpen();
+        if (requestId != s_requestId)        revert InvalidVRFRequest();
+        if (status != LotteryStatus.Drawing) revert NotOpen();
 
-        // Select winner weighted by ticket count
-        uint256 winningTicket = randomWords[0] % ticketsSold;
-        uint256 cumulative    = 0;
-        address selectedWinner;
-
-        for (uint256 i = 0; i < _buyers.length; i++) {
-            cumulative += ticketsBought[_buyers[i]];
-            if (winningTicket < cumulative) {
-                selectedWinner = _buyers[i];
-                break;
-            }
+        // Working copy of ticket weights, mutated as winners are removed.
+        uint256 buyerCount = _buyers.length;
+        uint256[] memory weights = new uint256[](buyerCount);
+        for (uint256 i = 0; i < buyerCount; i++) {
+            weights[i] = ticketsBought[_buyers[i]];
         }
 
-        winner = selectedWinner;
+        uint256 remainingTicketsPool = ticketsSold;
+        uint256 ranksToDraw = tierCount < buyerCount ? tierCount : buyerCount;
+
+        for (uint256 rank = 0; rank < ranksToDraw; rank++) {
+            uint256 pick = randomWords[rank] % remainingTicketsPool;
+            uint256 cumulative = 0;
+            uint256 selectedIndex = type(uint256).max;
+
+            for (uint256 i = 0; i < buyerCount; i++) {
+                if (weights[i] == 0) continue; // already won a rank
+                cumulative += weights[i];
+                if (pick < cumulative) {
+                    selectedIndex = i;
+                    break;
+                }
+            }
+
+            address selectedWinner = _buyers[selectedIndex];
+            winners[rank] = selectedWinner;
+
+            remainingTicketsPool -= weights[selectedIndex];
+            weights[selectedIndex] = 0; // remove from future picks
+
+            PrizeSchemeRegistry.PrizeScheme memory scheme =
+                prizeSchemeRegistry.getScheme(schemeId);
+            uint256 prize = (prizePool * scheme.tierBps[rank]) / 10000;
+
+            emit WinnerSelected(lotteryId, rank, selectedWinner, prize);
+        }
+
         status = LotteryStatus.Completed;
 
-        uint256 fee   = (prizePool * feeBps) / 10000;
-        uint256 prize = prizePool - fee;
-
-        emit WinnerSelected(lotteryId, selectedWinner, prize);
-
-        // Pay platform fee immediately (state already updated — CEI satisfied)
+        // Pay platform fee once, after all winners are selected.
+        PrizeSchemeRegistry.PrizeScheme memory feeScheme =
+            prizeSchemeRegistry.getScheme(schemeId);
+        uint256 fee = (prizePool * feeScheme.feeBps) / 10000;
         if (fee > 0) {
             (bool feeSuccess,) = feeRecipient.call{value: fee}("");
             if (!feeSuccess) revert TransferFailed();
@@ -265,18 +289,22 @@ contract LotteryCore is
 
     // ─── Prize Claim ─────────────────────────────────────────────────────────
 
-    /// @notice Winner claims their prize after draw completes.
-    function claimPrize() external nonReentrant {
+    /// @notice Claim your prize for a specific rank. Caller must be that
+    ///         rank's winner.
+    /// @param rank 0-indexed prize rank (0 = top prize).
+    function claimPrize(uint256 rank) external nonReentrant {
         if (status != LotteryStatus.Completed) revert NotCompleted();
-        if (msg.sender != winner)              revert NotWinner();
-        if (prizeClaimed)                      revert AlreadyClaimed();
+        if (rank >= tierCount)                 revert InvalidRank();
+        if (msg.sender != winners[rank])       revert NotWinner();
+        if (rankClaimed[rank])                 revert AlreadyClaimed();
 
-        prizeClaimed = true;
+        rankClaimed[rank] = true;
 
-        uint256 fee   = (prizePool * feeBps) / 10000;
-        uint256 prize = prizePool - fee;
+        PrizeSchemeRegistry.PrizeScheme memory scheme =
+            prizeSchemeRegistry.getScheme(schemeId);
+        uint256 prize = (prizePool * scheme.tierBps[rank]) / 10000;
 
-        emit PrizeClaimed(lotteryId, msg.sender, prize);
+        emit PrizeClaimed(lotteryId, rank, msg.sender, prize);
 
         (bool success,) = msg.sender.call{value: prize}("");
         if (!success) revert TransferFailed();
@@ -284,7 +312,6 @@ contract LotteryCore is
 
     // ─── Refunds ─────────────────────────────────────────────────────────────
 
-    /// @notice Trigger refund mode if drawTime passed and minTickets not met.
     function triggerRefund()
         external
         onlyRole(OPERATOR_ROLE)
@@ -298,11 +325,10 @@ contract LotteryCore is
         emit RefundTriggered(lotteryId, ticketsSold);
     }
 
-    /// @notice Buyers claim their individual refunds when in Refunding status.
     function claimRefund() external nonReentrant {
-        if (status != LotteryStatus.Refunding)     revert NotRefunding();
-        if (ticketsBought[msg.sender] == 0)        revert NoTicketsPurchased();
-        if (refundClaimed[msg.sender])             revert AlreadyClaimed();
+        if (status != LotteryStatus.Refunding) revert NotRefunding();
+        if (ticketsBought[msg.sender] == 0)    revert NoTicketsPurchased();
+        if (refundClaimed[msg.sender])         revert AlreadyClaimed();
 
         uint256 refundAmount = ticketsBought[msg.sender] * ticketPrice;
         refundClaimed[msg.sender] = true;
@@ -320,7 +346,7 @@ contract LotteryCore is
 
     // ─── Views ───────────────────────────────────────────────────────────────
 
-    function getBuyerCount()      external view returns (uint256) { return _buyers.length; }
-    function getBuyer(uint256 i)  external view returns (address) { return _buyers[i]; }
-    function remainingTickets()   external view returns (uint256) { return maxTickets - ticketsSold; }
+    function getBuyerCount()     external view returns (uint256) { return _buyers.length; }
+    function getBuyer(uint256 i) external view returns (address) { return _buyers[i]; }
+    function remainingTickets()  external view returns (uint256) { return maxTickets - ticketsSold; }
 }
