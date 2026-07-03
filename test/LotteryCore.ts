@@ -348,3 +348,219 @@ describe("LotteryCore", function () {
     });
   });
 });
+
+// ─── Chainlink Automation ──────────────────────────────────────────────────
+
+describe("LotteryCore — Chainlink Automation", function () {
+  const KEY_HASH_LOCAL = "0x787d74caea10b2b357790d5b5247c2f63d1d91572a9846f780606e4d953677ae";
+  const CALLBACK_GAS_LIMIT_LOCAL = 500_000;
+  const REQUEST_CONFIRMATIONS_LOCAL = 3;
+  const BASE_FEE_LOCAL = "100000000000000000";
+  const GAS_PRICE_LINK_LOCAL = "1000000000";
+
+  async function setupAutomation(overrides: {
+    minTickets?: bigint;
+    drawTimeOffset?: number;
+  } = {}) {
+    const connection = await hre.network.create();
+    const { ethers } = connection;
+
+    const [admin, forwarder, buyer1, buyer2, buyer3, feeRecipient, stranger] =
+      await ethers.getSigners();
+
+    const MockCoordinator = await ethers.getContractFactory("VRFCoordinatorV2_5Mock");
+    const mockCoordinator = await MockCoordinator.deploy(BASE_FEE_LOCAL, GAS_PRICE_LINK_LOCAL, "4000000000000000");
+    await mockCoordinator.waitForDeployment();
+
+    const createSubTx = await mockCoordinator.createSubscription();
+    const receipt = await createSubTx.wait();
+    const subLog = receipt!.logs.find((l: any) => l.fragment?.name === "SubscriptionCreated") as any;
+    const subscriptionId: bigint = subLog.args[0];
+    await mockCoordinator.fundSubscription(subscriptionId, ethers.parseEther("1000"));
+
+    const Registry = await ethers.getContractFactory("PrizeSchemeRegistry");
+    const registry = await Registry.deploy(admin.address);
+    await registry.waitForDeployment();
+    await registry.connect(admin).createScheme("Test", [9500n], 500n, false);
+
+    const ticketPrice    = ethers.parseEther("0.1");
+    const maxTickets     = 100n;
+    const minTickets     = overrides.minTickets ?? 3n;
+    const drawTimeOffset = overrides.drawTimeOffset ?? 60;
+
+    const block    = await ethers.provider.getBlock("latest");
+    const drawTime = BigInt(block!.timestamp + drawTimeOffset);
+
+    const LotteryCore = await ethers.getContractFactory("LotteryCore");
+    const lottery = await LotteryCore.deploy(
+      {
+        vrfCoordinator: await mockCoordinator.getAddress(),
+        subscriptionId, keyHash: KEY_HASH_LOCAL,
+        callbackGasLimit: CALLBACK_GAS_LIMIT_LOCAL,
+        requestConfirmations: REQUEST_CONFIRMATIONS_LOCAL,
+      },
+      {
+        factory: admin.address, lotteryId: 0n, admin: admin.address,
+        ticketPrice, maxTickets, minTickets, drawTime,
+        feeRecipient: feeRecipient.address,
+        prizeSchemeRegistry: await registry.getAddress(), schemeId: 0n,
+      }
+    );
+    await lottery.waitForDeployment();
+    await mockCoordinator.addConsumer(subscriptionId, await lottery.getAddress());
+
+    return {
+      ethers, lottery, mockCoordinator, admin, forwarder,
+      buyer1, buyer2, buyer3, stranger, ticketPrice, minTickets, drawTime,
+    };
+  }
+
+  describe("checkUpkeep()", function () {
+    it("Should return false before drawTime", async function () {
+      const { lottery } = await setupAutomation();
+      const [upkeepNeeded] = await lottery.checkUpkeep("0x");
+      expect(upkeepNeeded).to.be.false;
+    });
+
+    it("Should return true with draw signal when minTickets met after drawTime", async function () {
+      const { lottery, buyer1, buyer2, buyer3, ticketPrice, ethers } =
+        await setupAutomation({ minTickets: 3n });
+      await lottery.connect(buyer1).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer2).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer3).buyTickets(1n, { value: ticketPrice });
+      await ethers.provider.send("evm_increaseTime", [120]);
+      await ethers.provider.send("evm_mine", []);
+
+      const [upkeepNeeded, performData] = await lottery.checkUpkeep("0x");
+      expect(upkeepNeeded).to.be.true;
+      const shouldDraw = ethers.AbiCoder.defaultAbiCoder().decode(["bool"], performData)[0];
+      expect(shouldDraw).to.be.true;
+    });
+
+    it("Should return true with refund signal when minTickets not met after drawTime", async function () {
+      const { lottery, buyer1, ticketPrice, ethers } =
+        await setupAutomation({ minTickets: 5n });
+      await lottery.connect(buyer1).buyTickets(1n, { value: ticketPrice });
+      await ethers.provider.send("evm_increaseTime", [120]);
+      await ethers.provider.send("evm_mine", []);
+
+      const [upkeepNeeded, performData] = await lottery.checkUpkeep("0x");
+      expect(upkeepNeeded).to.be.true;
+      const shouldDraw = ethers.AbiCoder.defaultAbiCoder().decode(["bool"], performData)[0];
+      expect(shouldDraw).to.be.false;
+    });
+  });
+
+  describe("performUpkeep()", function () {
+    it("Should allow OPERATOR_ROLE to perform upkeep when forwarder unset", async function () {
+      const { lottery, admin, buyer1, buyer2, buyer3, ticketPrice, ethers } =
+        await setupAutomation({ minTickets: 3n });
+      await lottery.connect(buyer1).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer2).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer3).buyTickets(1n, { value: ticketPrice });
+      await ethers.provider.send("evm_increaseTime", [120]);
+      await ethers.provider.send("evm_mine", []);
+
+      const [, performData] = await lottery.checkUpkeep("0x");
+      await lottery.connect(admin).performUpkeep(performData);
+      expect(await lottery.status()).to.equal(2n); // Drawing
+    });
+
+    it("Should revert performUpkeep from unauthorized address when forwarder unset", async function () {
+      const { lottery, stranger, buyer1, buyer2, buyer3, ticketPrice, ethers } =
+        await setupAutomation({ minTickets: 3n });
+      await lottery.connect(buyer1).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer2).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer3).buyTickets(1n, { value: ticketPrice });
+      await ethers.provider.send("evm_increaseTime", [120]);
+      await ethers.provider.send("evm_mine", []);
+
+      const [, performData] = await lottery.checkUpkeep("0x");
+      await expect(
+        lottery.connect(stranger).performUpkeep(performData)
+      ).to.be.revertedWithCustomError(lottery, "NotAuthorizedForUpkeep");
+    });
+
+    it("Should allow the registered forwarder to perform upkeep", async function () {
+      const { lottery, admin, forwarder, buyer1, buyer2, buyer3, ticketPrice, ethers } =
+        await setupAutomation({ minTickets: 3n });
+      await lottery.connect(admin).setAutomationForwarder(forwarder.address);
+
+      await lottery.connect(buyer1).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer2).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer3).buyTickets(1n, { value: ticketPrice });
+      await ethers.provider.send("evm_increaseTime", [120]);
+      await ethers.provider.send("evm_mine", []);
+
+      const [, performData] = await lottery.checkUpkeep("0x");
+      await lottery.connect(forwarder).performUpkeep(performData);
+      expect(await lottery.status()).to.equal(2n);
+    });
+
+    it("Should revert performUpkeep from non-forwarder, non-operator once forwarder is set", async function () {
+      const { lottery, admin, forwarder, stranger, buyer1, buyer2, buyer3, ticketPrice, ethers } =
+        await setupAutomation({ minTickets: 3n });
+      await lottery.connect(admin).setAutomationForwarder(forwarder.address);
+
+      await lottery.connect(buyer1).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer2).buyTickets(1n, { value: ticketPrice });
+      await lottery.connect(buyer3).buyTickets(1n, { value: ticketPrice });
+      await ethers.provider.send("evm_increaseTime", [120]);
+      await ethers.provider.send("evm_mine", []);
+
+      const [, performData] = await lottery.checkUpkeep("0x");
+      await expect(
+        lottery.connect(stranger).performUpkeep(performData)
+      ).to.be.revertedWithCustomError(lottery, "NotAuthorizedForUpkeep");
+    });
+
+    it("Should trigger refund path via performUpkeep when minTickets not met", async function () {
+      const { lottery, admin, buyer1, ticketPrice, ethers } =
+        await setupAutomation({ minTickets: 5n });
+      await lottery.connect(buyer1).buyTickets(1n, { value: ticketPrice });
+      await ethers.provider.send("evm_increaseTime", [120]);
+      await ethers.provider.send("evm_mine", []);
+
+      const [, performData] = await lottery.checkUpkeep("0x");
+      await lottery.connect(admin).performUpkeep(performData);
+      expect(await lottery.status()).to.equal(4n); // Refunding
+    });
+
+    it("Should revert performUpkeep if drawTime not yet reached", async function () {
+      const { lottery, admin } = await setupAutomation({ drawTimeOffset: 3600 });
+      const fakePerformData = "0x0000000000000000000000000000000000000000000000000000000000000001";
+      await expect(
+        lottery.connect(admin).performUpkeep(fakePerformData)
+      ).to.be.revertedWithCustomError(lottery, "UpkeepNotNeeded");
+    });
+  });
+
+  describe("setAutomationForwarder()", function () {
+    it("Should set the forwarder address", async function () {
+      const { lottery, admin, forwarder } = await setupAutomation();
+      await lottery.connect(admin).setAutomationForwarder(forwarder.address);
+      expect(await lottery.automationForwarder()).to.equal(forwarder.address);
+    });
+
+    it("Should emit AutomationForwarderSet event", async function () {
+      const { lottery, admin, forwarder } = await setupAutomation();
+      await expect(lottery.connect(admin).setAutomationForwarder(forwarder.address))
+        .to.emit(lottery, "AutomationForwarderSet")
+        .withArgs(forwarder.address);
+    });
+
+    it("Should revert when called by non-admin", async function () {
+      const { lottery, stranger, forwarder } = await setupAutomation();
+      await expect(
+        lottery.connect(stranger).setAutomationForwarder(forwarder.address)
+      ).to.be.revertedWithCustomError(lottery, "AccessControlUnauthorizedAccount");
+    });
+
+    it("Should revert setting zero address as forwarder", async function () {
+      const { lottery, admin, ethers } = await setupAutomation();
+      await expect(
+        lottery.connect(admin).setAutomationForwarder(ethers.ZeroAddress)
+      ).to.be.revertedWithCustomError(lottery, "ZeroAddress");
+    });
+  });
+});

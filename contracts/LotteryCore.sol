@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -14,11 +15,13 @@ import {PrizeSchemeRegistry} from "./PrizeSchemeRegistry.sol";
 ///         Supports multi-tier prize distribution via a referenced
 ///         PrizeSchemeRegistry scheme. Handles ticket sales, prize pool
 ///         accumulation, Chainlink VRF V2.5 multi-winner selection,
-///         per-rank prize claims, and refunds if minTickets not met.
+///         per-rank prize claims, refunds if minTickets not met, and
+///         Chainlink Automation for hands-free draw/refund triggering.
 /// @dev NOT upgradeable. CEI pattern on all fund movements. ReentrancyGuard
 ///      unconditional since this contract holds user funds.
 contract LotteryCore is
     VRFConsumerBaseV2Plus,
+    AutomationCompatibleInterface,
     ReentrancyGuard,
     Pausable,
     AccessControl
@@ -40,17 +43,19 @@ contract LotteryCore is
     uint16  public immutable requestConfirmations;
     uint256 public s_requestId;
 
+    // ─── Automation Config ───────────────────────────────────────────────────
+
+    /// @notice Address of the Chainlink Automation Forwarder authorized to
+    ///         call performUpkeep(). Zero until set by an admin after the
+    ///         upkeep is registered (the Forwarder address is only known
+    ///         post-registration). While zero, only OPERATOR_ROLE can call
+    ///         performUpkeep — Automation is effectively opt-in per draw.
+    address public automationForwarder;
+
     // ─── Prize Scheme ────────────────────────────────────────────────────────
 
-    /// @notice Registry holding the reusable prize scheme this draw uses.
     PrizeSchemeRegistry public immutable prizeSchemeRegistry;
-
-    /// @notice ID of the prize scheme in the registry this draw references.
     uint256 public immutable schemeId;
-
-    /// @notice Number of prize tiers (ranks) this draw pays out — snapshot
-    ///         from the scheme at draw creation, so later scheme edits
-    ///         (via deactivation + new scheme) never affect this draw.
     uint256 public immutable tierCount;
 
     // ─── Lottery State ───────────────────────────────────────────────────────
@@ -67,12 +72,8 @@ contract LotteryCore is
     uint256 public drawTime;
     address public feeRecipient;
 
-    /// @notice rank (0-indexed) => winning address. rank 0 = top prize.
     mapping(uint256 => address) public winners;
-
-    /// @notice rank => whether that rank's prize has been claimed.
     mapping(uint256 => bool) public rankClaimed;
-
     mapping(address => uint256) public ticketsBought;
     address[] private _buyers;
     mapping(address => bool) public refundClaimed;
@@ -86,6 +87,7 @@ contract LotteryCore is
     event PrizeClaimed(uint256 indexed lotteryId, uint256 indexed rank, address indexed winner, uint256 amount);
     event RefundTriggered(uint256 indexed lotteryId, uint256 ticketsSold);
     event RefundClaimed(uint256 indexed lotteryId, address indexed buyer, uint256 amount);
+    event AutomationForwarderSet(address indexed forwarder);
 
     // ─── Errors ──────────────────────────────────────────────────────────────
 
@@ -106,6 +108,8 @@ contract LotteryCore is
     error InvalidVRFRequest();
     error InvalidRank();
     error SchemeInactiveAtCreation();
+    error NotAuthorizedForUpkeep();
+    error UpkeepNotNeeded();
 
     // ─── Constructor ─────────────────────────────────────────────────────────
 
@@ -172,7 +176,6 @@ contract LotteryCore is
         emit LotteryOpened(draw.lotteryId, draw.drawTime, draw.ticketPrice);
     }
 
-
     // ─── Ticket Purchase ─────────────────────────────────────────────────────
 
     function buyTickets(uint256 count)
@@ -199,13 +202,17 @@ contract LotteryCore is
 
     // ─── Draw ────────────────────────────────────────────────────────────────
 
-    /// @notice Request winner selection via Chainlink VRF. Requests `tierCount`
-    ///         random words in one call — one per prize rank.
+    /// @notice Request winner selection via Chainlink VRF. Callable manually
+    ///         by an operator, or automatically via performUpkeep().
     function requestDraw()
         external
         onlyRole(OPERATOR_ROLE)
         nonReentrant
     {
+        _requestDraw();
+    }
+
+    function _requestDraw() internal {
         if (status != LotteryStatus.Open)  revert NotOpen();
         if (block.timestamp < drawTime)    revert DrawTimeNotReached();
         if (ticketsSold < minTickets)      revert MinTicketsNotMet();
@@ -238,7 +245,6 @@ contract LotteryCore is
         if (requestId != s_requestId)        revert InvalidVRFRequest();
         if (status != LotteryStatus.Drawing) revert NotOpen();
 
-        // Working copy of ticket weights, mutated as winners are removed.
         uint256 buyerCount = _buyers.length;
         uint256[] memory weights = new uint256[](buyerCount);
         for (uint256 i = 0; i < buyerCount; i++) {
@@ -254,7 +260,7 @@ contract LotteryCore is
             uint256 selectedIndex = type(uint256).max;
 
             for (uint256 i = 0; i < buyerCount; i++) {
-                if (weights[i] == 0) continue; // already won a rank
+                if (weights[i] == 0) continue;
                 cumulative += weights[i];
                 if (pick < cumulative) {
                     selectedIndex = i;
@@ -266,7 +272,7 @@ contract LotteryCore is
             winners[rank] = selectedWinner;
 
             remainingTicketsPool -= weights[selectedIndex];
-            weights[selectedIndex] = 0; // remove from future picks
+            weights[selectedIndex] = 0;
 
             PrizeSchemeRegistry.PrizeScheme memory scheme =
                 prizeSchemeRegistry.getScheme(schemeId);
@@ -277,7 +283,6 @@ contract LotteryCore is
 
         status = LotteryStatus.Completed;
 
-        // Pay platform fee once, after all winners are selected.
         PrizeSchemeRegistry.PrizeScheme memory feeScheme =
             prizeSchemeRegistry.getScheme(schemeId);
         uint256 fee = (prizePool * feeScheme.feeBps) / 10000;
@@ -289,9 +294,6 @@ contract LotteryCore is
 
     // ─── Prize Claim ─────────────────────────────────────────────────────────
 
-    /// @notice Claim your prize for a specific rank. Caller must be that
-    ///         rank's winner.
-    /// @param rank 0-indexed prize rank (0 = top prize).
     function claimPrize(uint256 rank) external nonReentrant {
         if (status != LotteryStatus.Completed) revert NotCompleted();
         if (rank >= tierCount)                 revert InvalidRank();
@@ -312,11 +314,17 @@ contract LotteryCore is
 
     // ─── Refunds ─────────────────────────────────────────────────────────────
 
+    /// @notice Trigger refund mode. Callable manually by an operator, or
+    ///         automatically via performUpkeep().
     function triggerRefund()
         external
         onlyRole(OPERATOR_ROLE)
         nonReentrant
     {
+        _triggerRefund();
+    }
+
+    function _triggerRefund() internal {
         if (status != LotteryStatus.Open)  revert NotOpen();
         if (block.timestamp < drawTime)    revert DrawTimeNotReached();
         if (ticketsSold >= minTickets)     revert MinTicketsMet();
@@ -337,6 +345,65 @@ contract LotteryCore is
 
         (bool success,) = msg.sender.call{value: refundAmount}("");
         if (!success) revert TransferFailed();
+    }
+
+    // ─── Chainlink Automation ────────────────────────────────────────────────
+
+    /// @notice Sets the authorized Automation Forwarder address. Only callable
+    ///         once by an admin, after registering this contract as an upkeep
+    ///         in the Chainlink Automation App (the Forwarder address is only
+    ///         known post-registration).
+    function setAutomationForwarder(address forwarder) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (forwarder == address(0)) revert ZeroAddress();
+        automationForwarder = forwarder;
+        emit AutomationForwarderSet(forwarder);
+    }
+
+    /// @notice Off-chain simulated by Chainlink Automation nodes every block.
+    ///         Returns true when either a draw or a refund should be triggered.
+    /// @dev View-only, gas cost irrelevant (never executed on-chain directly).
+    function checkUpkeep(bytes calldata /* checkData */)
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        if (status != LotteryStatus.Open || block.timestamp < drawTime) {
+            return (false, bytes(""));
+        }
+
+        if (ticketsSold >= minTickets) {
+            return (true, abi.encode(true)); // true = requestDraw path
+        } else {
+            return (true, abi.encode(false)); // false = triggerRefund path
+        }
+    }
+
+    /// @notice Executed on-chain by the Automation Forwarder when checkUpkeep
+    ///         returns true. Re-validates all conditions independently of
+    ///         checkUpkeep's result, per Chainlink Automation best practice.
+    function performUpkeep(bytes calldata performData) external override nonReentrant {
+        if (automationForwarder != address(0)) {
+            if (msg.sender != automationForwarder && !hasRole(OPERATOR_ROLE, msg.sender)) {
+                revert NotAuthorizedForUpkeep();
+            }
+        } else {
+            if (!hasRole(OPERATOR_ROLE, msg.sender)) revert NotAuthorizedForUpkeep();
+        }
+
+        if (status != LotteryStatus.Open || block.timestamp < drawTime) {
+            revert UpkeepNotNeeded();
+        }
+
+        bool shouldDraw = abi.decode(performData, (bool));
+
+        if (shouldDraw) {
+            if (ticketsSold < minTickets) revert UpkeepNotNeeded();
+            _requestDraw();
+        } else {
+            if (ticketsSold >= minTickets) revert UpkeepNotNeeded();
+            _triggerRefund();
+        }
     }
 
     // ─── Pause ───────────────────────────────────────────────────────────────
