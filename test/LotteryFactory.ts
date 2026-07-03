@@ -30,7 +30,7 @@ describe("LotteryFactory", function () {
     await mockCoordinator.fundSubscription(subscriptionId, ethers.parseEther("1000"));
 
     const Registry = await ethers.getContractFactory("PrizeSchemeRegistry");
-    const registry = await Registry.deploy(admin.address);
+    const registry = await upgradesApi.deployProxy(Registry, [admin.address], { kind: "uups" });
     await registry.waitForDeployment();
     await registry.connect(admin).createScheme("Standard 3-tier", [5000n, 3000n, 1000n], 500n, false);
     const schemeId = 0n;

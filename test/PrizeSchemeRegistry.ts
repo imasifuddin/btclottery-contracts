@@ -1,19 +1,21 @@
 import { expect } from "chai";
 import hre from "hardhat";
+import { upgrades } from "@openzeppelin/hardhat-upgrades";
 
 describe("PrizeSchemeRegistry", function () {
   async function setup() {
     const connection = await hre.network.create();
     const { ethers } = connection;
+    const upgradesApi = await upgrades(hre, connection);
     const [admin, manager, stranger] = await ethers.getSigners();
 
     const Registry = await ethers.getContractFactory("PrizeSchemeRegistry");
-    const registry = await Registry.deploy(admin.address);
+    const registry = await upgradesApi.deployProxy(Registry, [admin.address], { kind: "uups" });
     await registry.waitForDeployment();
 
     const SCHEME_MANAGER_ROLE = await registry.SCHEME_MANAGER_ROLE();
 
-    return { ethers, registry, admin, manager, stranger, SCHEME_MANAGER_ROLE };
+    return { ethers, upgradesApi, registry, admin, manager, stranger, SCHEME_MANAGER_ROLE };
   }
 
   describe("Deployment", function () {
@@ -30,10 +32,10 @@ describe("PrizeSchemeRegistry", function () {
     });
 
     it("Should revert deployment with zero admin address", async function () {
-      const { ethers } = await setup();
+      const { ethers, upgradesApi } = await setup();
       const Registry = await ethers.getContractFactory("PrizeSchemeRegistry");
       await expect(
-        Registry.deploy(ethers.ZeroAddress)
+        upgradesApi.deployProxy(Registry, [ethers.ZeroAddress], { kind: "uups" })
       ).to.be.revertedWithCustomError(Registry, "InvalidParam");
     });
   });

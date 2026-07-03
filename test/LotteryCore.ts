@@ -22,6 +22,7 @@ describe("LotteryCore", function () {
   } = {}) {
     const connection = await hre.network.create();
     const { ethers } = connection;
+    const upgradesApi = await upgrades(hre, connection);
 
     const [admin, buyer1, buyer2, buyer3, buyer4, feeRecipient] =
       await ethers.getSigners();
@@ -39,7 +40,7 @@ describe("LotteryCore", function () {
 
     // Deploy prize scheme registry + create a scheme
     const Registry = await ethers.getContractFactory("PrizeSchemeRegistry");
-    const registry = await Registry.deploy(admin.address);
+    const registry = await upgradesApi.deployProxy(Registry, [admin.address], { kind: "uups" });
     await registry.waitForDeployment();
 
     const tierBps  = overrides.tierBps  ?? [5000n, 3000n, 1000n]; // 3-tier default
@@ -364,6 +365,7 @@ describe("LotteryCore — Chainlink Automation", function () {
   } = {}) {
     const connection = await hre.network.create();
     const { ethers } = connection;
+    const upgradesApi = await upgrades(hre, connection);
 
     const [admin, forwarder, buyer1, buyer2, buyer3, feeRecipient, stranger] =
       await ethers.getSigners();
@@ -379,7 +381,7 @@ describe("LotteryCore — Chainlink Automation", function () {
     await mockCoordinator.fundSubscription(subscriptionId, ethers.parseEther("1000"));
 
     const Registry = await ethers.getContractFactory("PrizeSchemeRegistry");
-    const registry = await Registry.deploy(admin.address);
+    const registry = await upgradesApi.deployProxy(Registry, [admin.address], { kind: "uups" });
     await registry.waitForDeployment();
     await registry.connect(admin).createScheme("Test", [9500n], 500n, false);
 
