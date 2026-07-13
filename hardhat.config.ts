@@ -1,3 +1,4 @@
+import "dotenv/config";
 import hardhatToolboxMochaEthersPlugin from "@nomicfoundation/hardhat-toolbox-mocha-ethers";
 import hardhatUpgrades from "@openzeppelin/hardhat-upgrades";
 import { configVariable, defineConfig } from "hardhat/config";
@@ -29,6 +30,7 @@ export default defineConfig({
     },
     npmFilesToBuild: [
       "@chainlink/contracts/src/v0.8/vrf/mocks/VRFCoordinatorV2_5Mock.sol",
+      "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol",
     ],
   },
   networks: {

@@ -28,7 +28,7 @@ importers:
         version: 4.0.2(@nomicfoundation/hardhat-ethers@4.0.13(hardhat@3.9.0))(@nomicfoundation/hardhat-verify@3.0.20(hardhat@3.9.0))(ethers@6.17.0)(hardhat@3.9.0)(supports-color@8.1.1)
       '@openzeppelin/merkle-tree':
         specifier: ^1.0.8
-        version: 1.0.8
+        version: 1.0.8(supports-color@8.1.1)
       '@types/chai':
         specifier: ^5.2.3
         version: 5.2.3
@@ -41,6 +41,9 @@ importers:
       chai:
         specifier: ^6.2.2
         version: 6.2.2
+      dotenv:
+        specifier: ^17.4.2
+        version: 17.4.2
       ethers:
         specifier: ^6.17.0
         version: 6.17.0
@@ -1252,6 +1255,10 @@ packages:
   dir-glob@3.0.1:
     resolution: {integrity: sha512-WkrWp9GR4KXfKGYzOLmTuGVi1UWFfws377n9cc55/tb6DuqyF6pcQ5AbiHEshaDpY9v6oaSr2XCDidGmMwdzIA==}
     engines: {node: '>=8'}
+
+  dotenv@17.4.2:
+    resolution: {integrity: sha512-nI4U3TottKAcAD9LLud4Cb7b2QztQMUEfHbvhTH09bqXTxnSie8WnjPALV/WMCrJZ6UV/qHJ6L03OqO3LcdYZw==}
+    engines: {node: '>=12'}
 
   dunder-proto@1.0.1:
     resolution: {integrity: sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A==}
@@ -3104,16 +3111,16 @@ snapshots:
       globby: 11.1.0
       read-yaml-file: 1.1.0
 
-  '@metamask/abi-utils@2.0.4':
+  '@metamask/abi-utils@2.0.4(supports-color@8.1.1)':
     dependencies:
       '@metamask/superstruct': 3.3.0
-      '@metamask/utils': 9.3.0
+      '@metamask/utils': 9.3.0(supports-color@8.1.1)
     transitivePeerDependencies:
       - supports-color
 
   '@metamask/superstruct@3.3.0': {}
 
-  '@metamask/utils@9.3.0':
+  '@metamask/utils@9.3.0(supports-color@8.1.1)':
     dependencies:
       '@ethereumjs/tx': 4.2.0
       '@metamask/superstruct': 3.3.0
@@ -3457,9 +3464,9 @@ snapshots:
       - encoding
       - supports-color
 
-  '@openzeppelin/merkle-tree@1.0.8':
+  '@openzeppelin/merkle-tree@1.0.8(supports-color@8.1.1)':
     dependencies:
-      '@metamask/abi-utils': 2.0.4
+      '@metamask/abi-utils': 2.0.4(supports-color@8.1.1)
       ethereum-cryptography: 3.2.0
     transitivePeerDependencies:
       - supports-color
@@ -3966,6 +3973,8 @@ snapshots:
   dir-glob@3.0.1:
     dependencies:
       path-type: 4.0.0
+
+  dotenv@17.4.2: {}
 
   dunder-proto@1.0.1:
     dependencies:
