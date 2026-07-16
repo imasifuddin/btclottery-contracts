@@ -55,4 +55,9 @@ export default defineConfig({
       accounts: [configVariable("POLYGON_AMOY_PRIVATE_KEY")],
     },
   },
+  verify: {
+    etherscan: {
+      apiKey: configVariable("ETHERSCAN_API_KEY"),
+    },
+  },
 });
