@@ -29,3 +29,7 @@
 
 # Snapshot cheatcodes output
 /snapshots
+
+# Generated per-game constructor arguments (scripts/gen-verify-args.ts).
+# Regenerated for each game being verified — never reuse across games.
+/verify-args.js

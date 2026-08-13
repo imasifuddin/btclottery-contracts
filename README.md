@@ -1,57 +1,54 @@
-# Sample Hardhat 3 Project (`node:test` and `viem`)
+# btclottery.io — Contracts
 
-This project showcases a Hardhat 3 project using the native Node.js test runner (`node:test`) and the `viem` library for Ethereum interactions.
+Smart contracts for the btclottery.io platform (Hardhat 3, `node:test` +
+`viem`). The on-chain layer is a **payload-driven game model**: an admin portal
+pushes a game + scheme JSON payload to our API, which deploys a fresh, immutable
+game contract carrying that entire payload on-chain.
 
-To learn more about Hardhat 3, please visit the [Getting Started guide](https://hardhat.org/docs/getting-started#getting-started-with-hardhat-3). To share your feedback, join our [Hardhat 3](https://hardhat.org/hardhat3-telegram-group) Telegram group or [open an issue](https://github.com/NomicFoundation/hardhat/issues/new) in our GitHub issue tracker.
+**Read [`ARCHITECTURE.md`](./ARCHITECTURE.md) first** — it is the source of
+truth for the design, the two contracts, the live Sepolia deployment, and
+locked decisions.
 
-## Project Overview
+## Contracts
 
-This example project includes:
+- **`contracts/GameFactory.sol`** — UUPS-upgradeable factory. `createGame(...)`
+  deploys a game and indexes it by id / address / gameCode. Proxy address is
+  permanent.
+- **`contracts/GameCore.sol`** — one immutable instance per game. Holds its own
+  funds; runs buying, the Chainlink VRF draw, batched winner finalization, and
+  claims.
+- **`contracts/test/MockUSDT.sol`** — ERC20 test double for the token path.
 
-- A simple Hardhat configuration file.
-- Foundry-compatible Solidity unit tests.
-- TypeScript integration tests using [`node:test`](nodejs.org/api/test.html), the new Node.js native test runner, and [`viem`](https://viem.sh/).
-- Examples demonstrating how to connect to different types of networks, including locally simulating OP mainnet.
+(`Counter.sol` is leftover Hardhat scaffold and not part of the platform.)
 
-## Usage
-
-### Running Tests
-
-To run all the tests in the project, execute the following command:
-
-```shell
-npx hardhat test
-```
-
-You can also selectively run the Solidity or `node:test` tests:
+## Common commands
 
 ```shell
-npx hardhat test solidity
-npx hardhat test nodejs
+npx hardhat test                       # all tests (Solidity + node:test)
+npx hardhat test nodejs                # GameCore + GameFactory suites
+npx hardhat compile
+
+# Deploy the factory (UUPS proxy) to Sepolia
+npx hardhat ignition deploy --network sepolia ignition/modules/GameFactory.ts \
+  --parameters ignition/parameters/sepolia.json
+
+# Verify immediately after deploying (--network is REQUIRED)
+npx hardhat ignition verify chain-11155111 --network sepolia
 ```
 
-### Make a deployment to Sepolia
+## Environment
 
-This project includes an example Ignition module to deploy the contract. You can deploy this module to a locally simulated chain or to Sepolia.
+`contracts/.env` (gitignored; not committed) provides `SEPOLIA_RPC_URL`,
+`SEPOLIA_PRIVATE_KEY`, and `ETHERSCAN_API_KEY`. Deployment parameters (admin +
+VRF config) live in `ignition/parameters/sepolia.json`.
 
-To run the deployment to a local chain:
+## Guardrails
 
-```shell
-npx hardhat ignition deploy ignition/modules/Counter.ts
-```
-
-To run the deployment to Sepolia, you need an account with funds to send the transaction. The provided Hardhat configuration includes a Configuration Variable called `SEPOLIA_PRIVATE_KEY`, which you can use to set the private key of the account you want to use.
-
-You can set the `SEPOLIA_PRIVATE_KEY` variable using the `hardhat-keystore` plugin or by setting it as an environment variable.
-
-To set the `SEPOLIA_PRIVATE_KEY` config variable using `hardhat-keystore`:
-
-```shell
-npx hardhat keystore set SEPOLIA_PRIVATE_KEY
-```
-
-After setting the variable, you can run the deployment with the Sepolia network:
-
-```shell
-npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
-```
+- **Never delete `ignition/deployments/`** — it is the deployment journal and
+  is required for Etherscan verification.
+- `.gitattributes` pins `*.sol` / `*.ts` / `*.json` to **LF** — do not remove
+  it; line-ending drift changes the solc metadata hash and breaks verification.
+- Any `GameCore` change applies to **new games only** (via a factory upgrade);
+  deployed games are immutable by design.
+- After contract changes, re-copy fresh ABIs to both
+  `packages/shared/src/abis/` and `backend/src/abis/`.

@@ -13,7 +13,10 @@ export default defineConfig({
           viaIR: true,
           optimizer: {
             enabled: true,
-            runs: 200,
+            // Low runs: GameFactory embeds GameCore's full creation bytecode,
+            // so the factory sits close to the EIP-170 24,576-byte limit.
+            // Optimise for size over per-call gas.
+            runs: 1,
           },
         },
       },
@@ -23,7 +26,10 @@ export default defineConfig({
           viaIR: true,
           optimizer: {
             enabled: true,
-            runs: 200,
+            // Low runs: GameFactory embeds GameCore's full creation bytecode,
+            // so the factory sits close to the EIP-170 24,576-byte limit.
+            // Optimise for size over per-call gas.
+            runs: 1,
           },
         },
       },

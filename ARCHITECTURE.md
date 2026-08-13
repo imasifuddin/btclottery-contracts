@@ -1,111 +1,317 @@
-# btclottery.io — Locked Requirement & Contract Architecture
+# btclottery.io — Contract Architecture (Source of Truth)
 
-This document is the single source of truth for what the client has confirmed they want, as of this stage of the project. It exists so that if the client requests changes later (post-demo), we have a clear record of what "the original ask" actually was, and can clearly identify what changed.
+This document describes the architecture **as currently built and deployed**.
+It is the single reference for how the on-chain layer works and why it is
+shaped this way. When the client changes a requirement, update the relevant
+section here rather than assuming history.
 
----
-
-## 1. The Locked Requirement (client's own description)
-
-> A person opens the project website and sees all kinds of lotteries available — "Raffle 1", "Raffle 2", etc. The admin decides how many people can join a given lottery. Once that many people join, the draw happens automatically and winner(s) are selected. To buy in, the user connects their wallet (MetaMask or similar) and enters the game. Once the lottery is full according to the admin's rules, all winners are selected randomly using Chainlink VRF — if it's a 1-winner lottery, 1 winner is picked; if it's a 3-4 winner lottery, 3-4 winners are picked.
-
-This is modeled directly on **btclottery.io**'s live "Fixed Lotteries" product (reference screenshots and links reviewed together). Key confirmed behaviors observed and matched:
-
-- Each lottery has a **fixed player cap** set by the admin (e.g. 20, 10, 5 players)
-- The draw is **capacity-triggered** — it fires the moment the last ticket sells, not on a timer or deadline
-- **No refund mechanism exists** — since a lottery cannot complete until full, there's nothing to refund
-- **Multiple winners per lottery are supported** — 1 winner for simple lotteries, or multiple ranked winners (1st/2nd/3rd/4th) with different prize shares for bigger ones
-- **Multiple lotteries run simultaneously and independently** — a user can browse and enter as many as they like
-- Wallet connection (MetaMask, and others) happens at the point of buying a ticket, not required just to browse
-- Confirmed with the client: **admin retains full control** — no DAO/community voting planned
-- Rolling jackpot (unclaimed pool carrying to the next draw) and Referral rewards are **pending client confirmation** — not yet locked, not yet built (see Section 4)
+> **Naming note:** earlier iterations used `Lottery*` contracts (a timer +
+> refund model, then a fixed-capacity model) plus a separate on-chain scheme
+> registry and treasury. **Those are superseded and deleted from the working
+> tree** — see [Section 9](#9-superseded-history). The live design is the
+> **payload-driven `Game*` model** described below.
 
 ---
 
-## 2. Contracts Needed for This Requirement, and Why
+## 1. The Locked Requirement
 
-Only what's actually required for the locked flow above. Each entry explains its purpose in plain terms.
+The client (btclottery.io) runs an admin portal where staff define **schemes**
+(how many winners and what share each gets) and **games** (an individual
+contest: ticket price, currency, sale window, how the draw is triggered). Both
+live in the **client's own database**.
 
-### `LotteryFactory.sol`
-**What it's for:** The admin's tool for creating a new lottery. Instead of manually deploying a new contract by hand every time, the admin panel will call one function — `createLottery(ticketPrice, maxTickets, schemeId)` — and this factory deploys a brand-new lottery instance automatically, remembers its address, and makes it discoverable to the frontend.
+When an admin clicks **"Push to Blockchain"**, the portal's backend POSTs a
+single JSON payload — the game plus its full scheme (prize ranks) — to **our
+API**. Our API converts it and sends **one transaction** to the `GameFactory`,
+which deploys a fresh `GameCore` instance carrying the **entire payload
+permanently on-chain**.
 
-**Why a separate contract instead of just deploying lotteries by hand:** consistency, speed, and a single place that knows every lottery that has ever existed on the platform (`getAllLotteries()`).
+Confirmed, locked behaviors:
 
-**Upgradeable:** Yes. This is permanent, long-lived infrastructure — if we need to fix something or add a feature to how lotteries get created, we can do so without changing its address or disrupting anything already running.
-
----
-
-### `LotteryCore.sol`
-**What it's for:** This is one actual lottery — "Raffle 1", "Raffle 2", however the frontend labels it. One of these gets deployed for every lottery the admin creates.
-
-**How it matches the locked requirement, step by step:**
-- Admin sets the **player/ticket cap** at creation (`maxTickets`) — this is "how many people can join," directly per the client's description.
-- Users call `buyTickets(count)`, paying with their connected wallet.
-- **The moment the cap is reached**, the same transaction that bought the final ticket **automatically triggers the draw** — no admin action, no waiting, no separate button. This matches "once all join according to admin rules then all winners will be selected."
-- Chainlink VRF is used to pick the winner(s) — genuinely random, impossible to predict or manipulate by anyone, including the platform.
-- **Supports 1 winner or multiple winners per lottery**, exactly as described — this is controlled by which prize scheme the lottery references (see `PrizeSchemeRegistry` below). A "1-winner lottery" uses a scheme with a single 100%-of-pool tier; a "3-4 winner lottery" uses a scheme with 3-4 ranked tiers (e.g. 50%/30%/15%/5%).
-- No deadlines, no minimum-ticket thresholds, no refunds anywhere in this contract — deliberately removed to match the confirmed capacity-only trigger model.
-
-**Upgradeable:** No. Each lottery is a one-time, disposable contest — once it's created, its rules should never change mid-game, which is exactly what non-upgradeability guarantees to users.
-
----
-
-### `PrizeSchemeRegistry.sol`
-**What it's for:** Where the admin defines "how many winners, and what share each winner gets" as a reusable template, instead of typing it out fresh every time.
-
-**How it maps to the requirement:** the client said "if it's a 1-winner lottery then 1 winner, or if it's 3-4 winner lotteries then 3-4 winners." This is exactly what a "scheme" represents:
-- A "Winner Takes All" scheme = 1 tier, ~95-100% to that single winner
-- A "4-Tier" scheme = 4 tiers, e.g. 1st gets 45%, 2nd gets 30%, 3rd gets 15%, 4th gets 10%
-
-Admin creates these schemes once, and every new lottery just points at whichever scheme fits (`schemeId`).
-
-**Upgradeable:** Yes — pure configuration data, no funds or user assets involved, safe to evolve without needing to change addresses.
+- Each game defines its own trigger: **COUNT** (draw fires automatically the
+  moment a fixed participant cap fills) or **DRAW_TIME** (draw after a set
+  timestamp).
+- **No refund mechanism** — a COUNT game that fills always completes; an
+  underfilled COUNT game can still be drawn by the operator after sale close
+  with whoever joined.
+- **Multiple winners per game** via a dynamic rank table — 1 winner or many
+  ranked tiers with different prize shares.
+- **Multiple games run simultaneously and independently.**
+- Wallet connection happens at the point of buying a ticket, not to browse.
+- **Admin-only control** — no DAO/community voting.
 
 ---
 
-### `BTCLPToken.sol` and `TicketNFT.sol`
-**Current relevance to the locked requirement:** Not part of the core flow described above. `BTCLPToken` exists for possible future governance/rewards use (not active yet). `TicketNFT` was built to make tickets visible as NFTs in a user's wallet, but **is not yet wired into `LotteryCore.buyTickets()`** — right now a "ticket" is just an internal count, not an actual minted NFT. This can be added later without disrupting the core lottery mechanic if the client wants tickets to visually appear in wallets.
+## 2. Architecture Principles (LOCKED)
+
+- **Payload-driven, no on-chain scheme registry.** Schemes are not stored in a
+  shared registry contract; each game's full scheme travels *inside its own
+  payload* and is embedded in that game at deploy time. (An earlier
+  `PrizeSchemeRegistry` was deleted at the client's direction.)
+- **No central treasury.** Each `GameCore` holds its **own** funds — ticket
+  proceeds accumulate in it, prizes are paid from it, the admin withdraws
+  surplus from it. (An earlier `Treasury.sol` was removed at client request;
+  the client "will come up with another idea" later.)
+- **Fully dynamic.** Any scheme shape (1–20 ranks, AMOUNT or ALLOCATION, any
+  winner ceilings, any claim types), COUNT or DRAW_TIME mode, native or ERC20
+  currency — all deploy with **zero code changes**.
+- **Two settlement modes**, fixed per game at creation:
+  - **OnChain** — buyers pay the contract from their own wallet; the game holds
+    the prize pool and winners claim from it.
+  - **OffChain (registry)** — the current mode for all new games. Buyers pay by
+    **card/UPI** through the client's payment gateway; our API then calls
+    `registerEntryFor` to record the entry. Proceeds accrue *notionally* so
+    prize amounts are still computed and published, but **the contract never
+    holds funds** and the admin settles prizes off-chain. `buyTickets`,
+    `prefund*` and `claimPrize` all revert on these games — deliberately, so
+    value can never be sent to a game with no payout path.
+  Both modes share the same participant list, capacity rule, VRF draw and
+  winner selection.
+- **`GameFactory` is UUPS-upgradeable** (its proxy is the permanent address).
+  `GameCore` bytecode is embedded in the factory, so changing game logic means:
+  edit `GameCore` → recompile → upgrade the factory proxy. New games use the
+  new logic.
+- **Deployed games are immutable forever.** `GameCore` is **not** upgradeable
+  and holds user funds directly — a deliberate trust guarantee to players.
+- **SPDX license: MIT** (locked).
 
 ---
 
-### `RaffleCore.sol`
-**Current relevance:** This is a *separate* product type (donated NFT/token prizes, not pooled cash) — not what the client described in the locked requirement above, which is specifically about pooled-ticket-sale lotteries. `RaffleCore` remains available if/when the platform wants to run donated-prize raffles alongside lotteries, but is not part of this specific locked flow.
+## 3. Contract Lineup (only these two)
+
+### `contracts/contracts/GameCore.sol` — one instance per game
+
+Not upgradeable. Holds its own funds. Carries its full game + scheme payload.
+
+**`GameConfig` struct:** `gameCode`, `gameName`, `schemeCode`, `schemeName`,
+`mode` (0 = Count, 1 = DrawTime), `ticketPrice` (18-decimal fixed point, in
+whatever unit `currencySymbol` names), `currency` (`address(0)` = native, else
+ERC20 — OnChain games only), `saleStart` / `saleClose` / `drawAt` (unix
+`uint64`), `maxParticipation` (`uint32`, COUNT only), `currencySymbol` (display
+unit: `"INR"`, `"ETH"`, …), `settlementMode` (0 = OnChain, 1 = OffChain).
+
+The last two were **appended** in v2, so the `config()` tuple indices the
+client's UI already reads (0–10) are unchanged.
+
+**Registering an off-chain purchase —
+`registerEntryFor(participant, count, externalRef)`:** operator-only, OffChain
+games only. Applies the same status/window/capacity rules as a wallet purchase,
+credits the participant, accrues `ticketPrice × count` notionally, and fires the
+auto-draw when the final seat is taken. `externalRef` (keccak256 of the payment
+`txnId`) is stored in `entries[]`, which serves as both the **duplicate guard**
+— making retries safe, since the same purchase can never be recorded twice —
+and the buyer's own **verification lookup**.
+
+**`RankConfig` struct:** `rank`, `maxWinners` (a **ceiling**, not a target),
+`prizeCategory` (0 = Amount, 1 = Allocation), `prizeAmount` (`uint128`, AMOUNT
+ranks), `allocationBps` (`uint16`, ALLOCATION ranks; 50% = 5000), `prizeType`
+(0 = Fixed, 1 = Dividend), `claimType` (0 = Auto, 1 = HeadOffice, 2 = Manual),
+`rankDescription`.
+
+**Enums:** `Status` (0 Open, 1 Drawing, 2 SeedReceived, 3 Finalizing,
+4 Finalized); `ClaimStatus` (0 None, 1 PendingApproval, 2 Claimable, 3 Claimed).
+
+**Buying — `buyTickets(count)` (payable):** native games send exact value;
+ERC20 games require the user to `approve` the **game** contract first, then
+send zero value. COUNT games **auto-trigger the VRF draw inside the buy tx that
+fills `maxParticipation`** — the cap counts **unique wallets**, not tickets, so
+repeat buys by an existing participant don't consume a slot.
+
+**Draw — `requestDraw()` (OPERATOR_ROLE):** DRAW_TIME games after `drawAt`;
+COUNT games after `saleClose` if the cap never filled (proceeds with whoever
+joined, must be > 0 participants).
+
+**Randomness (Chainlink VRF v2.5):** the VRF callback stores **only** the seed
+(`drawSeed`) and moves to `SeedReceived`. Winner computation happens separately
+in **batched `finalizeDraw(maxThisCall)` calls, callable by anyone** (fully
+deterministic from the seed). This decouples winner selection from VRF callback
+gas limits — client payloads can carry hundreds of winner slots.
+
+**Stuck-draw recovery — `retryDraw()`:** operator-only, permitted once a VRF
+request has gone unanswered for `DRAW_RETRY_DELAY` (1 hour). Without it a
+request Chainlink never fulfils would freeze the game permanently, since
+`requestDraw` only works from `Open` — participants would be stranded with no
+path to a result. The participant list is untouched across a retry, so fairness
+is preserved, and a late fulfilment of the abandoned request is ignored because
+`fulfillRandomWords` only accepts the current `s_requestId`.
+
+> **Why this matters in practice.** Chainlink reserves subscription funds
+> against the *declared* `callbackGasLimit` priced at the gas lane's maximum,
+> not against actual usage. An oversized limit therefore demands a large idle
+> LINK balance, and a subscription that falls below it leaves requests pending
+> until they expire. Our callback only stores a seed (~50k gas), so the limit
+> should be set accordingly — see `GameFactory.setVrfConfig`.
+
+**Winner rule (hardcoded defaults; may become payload-configurable later):**
+for `P` unique participants — `P ≤ 5` → 1 winner; `P ≤ 10` → 2; else
+`floor(10% of P)`, minimum 2. Capped by total rank slots and by `P`. Ranks fill
+**top-down**. **One wallet wins at most once per game** (`hasWon`).
+
+**Prize math:**
+- AMOUNT + Fixed → `prizeAmount` per winner.
+- AMOUNT + Dividend → `prizeAmount ÷ actual winners in that rank`.
+- ALLOCATION (either prize type) → `grossProceeds × allocationBps / 10000 ÷
+  actual winners in that rank`.
+- Sum of `allocationBps` is validated ≤ 10000; any remainder + rounding dust
+  becomes house surplus.
+
+**Claims:** Auto ranks are instantly `Claimable` after finalize; HeadOffice and
+Manual ranks sit at `PendingApproval` until `approvePrize(winner)`
+(OPERATOR_ROLE). Winners pull funds via `claimPrize()` (pull-payment from the
+game's own balance).
+
+**Admin funds:** `withdrawSurplus(to, amount)` (DEFAULT_ADMIN_ROLE, only after
+`Finalized`, only up to `balance − unclaimed liability`).
+`prefundNative()` / `prefundToken()` let anyone top up AMOUNT games whose fixed
+prizes may exceed proceeds.
+
+**UI views:** `config`, `getRanks()`, `participantCount()`, `ticketsSold`,
+`grossProceeds`, `status`, `getWinners()`, `winnerInfo(addr)`, `prizeBalance()`.
+
+**Known quirk:** because the factory deploys each game, the Chainlink-base
+`owner` of each `GameCore` is the **factory address** — harmless and expected.
+
+### `contracts/contracts/GameFactory.sol` — UUPS upgradeable
+
+- `initialize(InitParams{ admin, vrfCoordinator, vrfSubscriptionId, vrfKeyHash,
+  vrfCallbackGasLimit, vrfRequestConfirmations })`.
+- `createGame(cfg, ranks, gameAdmin)` — GAME_CREATOR_ROLE; rejects a duplicate
+  `gameCode`; deploys a `GameCore`; indexes it by id / address / gameCode;
+  emits `GameCreated(gameId, gameAddress, gameCode, schemeCode, currency,
+  creator)`.
+- `setVrfConfig(subscriptionId, keyHash, callbackGasLimit, requestConfirmations)`
+  — DEFAULT_ADMIN_ROLE. Applies to games created from then on; deployed games
+  keep the settings they were born with, which are immutable in each `GameCore`.
+  Chiefly used to keep `callbackGasLimit` close to real usage so the VRF
+  subscription is not forced to hold a large idle reserve.
+- Views: `getAllGames()`, `getGame(id)`, `getGameByCode(code)`,
+  `getGameCount()`.
+
+`contracts/contracts/test/MockUSDT.sol` exists only to exercise the ERC20 path
+in tests. `Counter.sol` is leftover Hardhat scaffold.
 
 ---
 
-## 3. How the Locked Flow Actually Works, End to End
+## 4. End-to-End Flow
 
-1. **User opens the site** → sees a list of lotteries (e.g. "Raffle 1: 15/20 players, prize pool 20 MATIC"), each one reading live from its own `LotteryCore` contract via `LotteryFactory.getAllLotteries()`.
-2. **User clicks "Buy Ticket"** → prompted to connect a wallet (MetaMask or other) if not already connected.
-3. **User confirms the transaction** → calls `LotteryCore.buyTickets(1)` with the exact ticket price.
-4. **If the lottery isn't full yet:** the purchase is simply recorded; the lottery stays open for others to join.
-5. **If this purchase fills the lottery:** in that same transaction, the contract automatically requests a random draw from Chainlink VRF — this is the "once all join according to admin rules" moment, and it happens without anyone needing to click anything further.
-6. **Chainlink responds (usually seconds to a couple of minutes later)** with verified randomness. The contract selects however many winners the lottery's prize scheme specifies — 1, or 3-4, exactly per the client's description — weighted fairly by how many tickets each person bought.
-7. **Winners are now public and visible on-chain** — anyone can see who won, immediately, no waiting for an announcement.
-8. **Each winner claims their share** by calling `claimPrize(rank)` — funds go straight to their wallet.
-9. **Every other lottery on the platform runs completely independently** — a user can be in 5 different lotteries at once, each filling up and drawing on its own separate timeline.
+1. Admin configures a game + scheme in the client's portal → clicks **Push to
+   Blockchain**.
+2. Portal POSTs the payload to our API (`POST /api/v1/games/push`).
+3. API validates + converts the payload and calls `createGame` on the factory
+   (one tx), then auto-registers the new game as a VRF consumer.
+4. Players `buyTickets(count)` directly from their own wallets during the sale
+   window.
+5. Draw fires: **COUNT** auto-draws when the cap fills; **DRAW_TIME** (or an
+   underfilled COUNT) is triggered by the operator via the API.
+6. Chainlink VRF returns randomness → the game stores the seed.
+7. Anyone (in practice, the API) calls `finalizeDraw` in batches until winners
+   are computed and the game is `Finalized`.
+8. Auto prizes are immediately claimable; HeadOffice/Manual prizes become
+   claimable after the operator `approvePrize`s them.
+9. Winners `claimPrize()` from their own wallets. The admin may
+   `withdrawSurplus` of anything above unclaimed liability.
 
 ---
 
-## 4. Explicitly Not Locked / Pending Client Decision
+## 5. Live Sepolia Deployment (chainId 11155111)
 
-These were discussed but are **not yet confirmed or built** — flagged clearly so nothing is assumed:
+| Item | Value |
+|---|---|
+| GameFactory **proxy** (the permanent address) | `0xb7132A1139d552373a8BE2795693417Ea8fDeC65` |
+| Implementation | `0x738a10760207a9B42169877fF48fcCE36F0c3c02` |
+| Operator wallet (all roles) | `0xb42718A49DC91C5653f0Be53bC73df51Fb8F2729` |
+| VRF Coordinator (Sepolia) | `0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1B` |
+| VRF keyHash | `0x787d74caea10b2b357790d5b5247c2f63d1d91572a9846f780606e4d953677ae` |
+| VRF subscription ID | `75292865757511940771629505450063568836747134001638153062922999998674938286392` |
+| callbackGasLimit / confirmations | 2,000,000 / 3 |
+| Demo game GAME0011 | `0x8bAFfc6B7FE2187c765a4701cEc68C96B189640d` |
+
+All three (proxy, implementation, GAME0011) are **verified on Etherscan**;
+later games auto-verify by bytecode matching. Each new game is auto-added as a
+VRF consumer by the API (manual fallback at vrf.chain.link).
+
+> **Never delete `ignition/deployments/`** — it is the deployment journal and
+> underpins Etherscan verification. Verify immediately after any deploy with
+> `npx hardhat ignition verify chain-11155111 --network sepolia` (the
+> `--network` flag is required or it targets chainId 31337).
+
+---
+
+## 6. Tests
+
+`test/GameCore.ts` + `test/GameFactory.ts` — **35 passing** (plus 3 Solidity
+`Counter` tests from the scaffold). Coverage includes: the client's exact
+payload, a structurally different payload (dynamism proof), the sale window,
+COUNT cap + auto-draw, DRAW_TIME, the winner rule (5→1, 8→2, 30→3 with exact
+prize math), batched finalize, all claim types, prefund + surplus, a full ERC20
+cycle, and a UUPS upgrade that preserves the game index.
+
+Registry-mode coverage: notional proceeds in rupees, duplicate `txnId`
+rejection, one `userId` counting as a single participant across repeat
+purchases, cap-fill auto-draw, blocked buying/prefunding/claiming, operator-only
+access, sale-window enforcement, a full 5-buyer INR cycle (winner correctly owed
+₹125 of a ₹250 pool), and a DRAW_TIME registry game.
+
+### ⚠️ Contract size
+
+`GameFactory` embeds GameCore's entire creation bytecode, so it sits at
+**24,416 bytes against the hard 24,576-byte EIP-170 limit** — about 160 bytes
+of headroom. The optimizer runs at `runs: 1` to buy that room, and
+`registerEntriesBatch` was dropped for the same reason (batching is only needed
+at volumes we do not yet have).
+
+**Any further addition to `GameCore` must be size-checked first.** If more room
+is genuinely needed, the structural fix is to stop embedding GameCore in the
+factory and deploy games as minimal-proxy clones instead — a real refactor, not
+a tweak.
+
+---
+
+## 7. Locked Working Defaults (client may revise; documented as defaults)
+
+1. **MANUAL** claim type currently behaves exactly like **HEAD_OFFICE**
+   (requires operator approval).
+2. The **winner rule is hardcoded** (10% / ≤10→2 / ≤5→1). Payload fields for it
+   don't exist yet; when the client adds them, thread through `GameConfig` +
+   `convert.ts` + a factory upgrade (old games unaffected).
+3. COUNT games whose sale closes before the cap fills: the operator may draw
+   with any number of buyers > 0.
+4. `finalizeDraw` is batched to handle large winner counts (payloads have
+   carried up to ~561 winner slots).
+5. Allocation sums ≤ 100%; the remainder + rounding dust is house surplus. If
+   the client always sends exactly 100%, the house receives nothing on those
+   games — **flagged to the client**.
+
+---
+
+## 8. Pending / Not Yet Locked
 
 | Item | Status |
 |---|---|
-| **DAO Governor + Timelock** (community voting on platform decisions) | Client has indicated preference for admin-only control. Not planned unless this changes. |
-| **Gnosis Safe Multisig** (3-of-5 signer wallet replacing single admin key) | Recommended before mainnet launch, not a coding task — a deployment/config step for later. |
-| **Referral Contract** (2% reward for referring paying users) | Pending client confirmation on priority/timing. |
-| **Rolling Jackpot Rollover** (unclaimed pool carries to next draw) | Pending client confirmation on whether this is core to the product's appeal. Only a placeholder flag (`isJackpot`) exists in `PrizeSchemeRegistry` today — no rollover logic has been built. |
+| **Custodial buy flow** (backend executes buys on behalf of users) | ⚠️ Awaiting client clarification. If the operator key signs buys, tickets would belong on-chain to the operator wallet, breaking one-wallet-wins-once / `winnerInfo` / `claimPrize`. Two valid resolutions: (a) user-wallet signing (no contract change), or (b) a true custodial model requiring a new `buyTicketsFor(user, count)` + factory upgrade + new games only. **Do not implement until the client answers who signs, who pays, who claims.** |
+| Winner-rule payload fields | Pending client decision (would become configurable). |
+| MANUAL vs HEAD_OFFICE distinct semantics | Pending client decision. |
+| 100%-allocation house-share | Pending client decision (see §7.5). |
+| DAO Governor / Timelock | Skipped — admin-only control confirmed. |
+| Gnosis Safe multisig | Deferred to mainnet configuration. |
+| Referral rewards / rolling jackpot | Pending client interest. |
 
 ---
 
-## 5. What's Built and Tested vs. What's Still Needed for a Real, Usable Site
+## 9. Superseded History
 
-**Built and tested (contract layer):**
-- `LotteryFactory.sol`, `LotteryCore.sol` (fixed-capacity model), `PrizeSchemeRegistry.sol` — the full locked flow above works correctly with real, passing tests.
+Earlier iterations, **deleted from the working tree** but preserved in git
+history (contracts repo, commits ≤ `4f09dac`) — do not resurrect without a
+client requirement:
 
-**Not yet built (needed to make this usable by a real person):**
-- Frontend — the actual website a user interacts with
-- Backend — event listening, notifications, caching draw data for fast page loads
-- Wiring `TicketNFT` into the purchase flow (optional, pending client interest)
-- The Graph subgraph — for fast historical data (past draws, past winners) instead of slow direct contract reads
+- `LotteryFactory` / `LotteryCore` — timer + refund model, then a
+  fixed-capacity model. Replaced by the payload-driven `Game*` model.
+- `PrizeSchemeRegistry` — a UUPS on-chain scheme registry. Replaced by
+  embedding the scheme in each game's payload.
+- `Treasury.sol` — a central fund vault. Removed; each game holds its own funds.
+- `BTCLPToken` (ERC20Votes), `TicketNFT`, `RaffleCore` (Merkle-whitelist
+  donated-prize raffles) — built then set aside; not part of the locked flow.
+
+Stale TypeChain bindings for some of these names still sit in
+`contracts/types/` as generated leftovers; they do not reflect the deployed
+contracts.

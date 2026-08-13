@@ -56,6 +56,8 @@ describe("GameFactory", function () {
       saleClose: BigInt(now + 3600),
       drawAt: 0n,
       maxParticipation: 9993,
+      currencySymbol: "ETH",
+      settlementMode: 0, // OnChain
     };
     const taaherRanks = [
       { rank: 1, maxWinners: 1,   prizeCategory: 1, prizeAmount: 0n, allocationBps: 5000, prizeType: 1, claimType: 1, rankDescription: "Jackpot" },
@@ -100,6 +102,7 @@ describe("GameFactory", function () {
       gameCode: "GAME0099", gameName: "Fixed Daily", schemeCode: "SCH0009", schemeName: "Std Fixed",
       mode: 1, ticketPrice: ethers.parseEther("0.05"), currency: ZeroAddress,
       saleStart: BigInt(now - 60), saleClose: BigInt(now + 1800), drawAt: BigInt(now + 3600), maxParticipation: 0,
+      currencySymbol: "ETH", settlementMode: 0,
     };
     const ranks = [
       { rank: 1, maxWinners: 1, prizeCategory: 0, prizeAmount: ethers.parseEther("2"),   allocationBps: 0, prizeType: 1, claimType: 1, rankDescription: "Grand" },
@@ -132,25 +135,40 @@ describe("GameFactory", function () {
     const { ethers, factory, admin, now, taaherCfg, taaherRanks } = await setup();
     const Game = await ethers.getContractFactory("GameCore");
 
+    // Config failures carry a numeric code (see InvalidConfig in GameCore).
     await expect(factory.connect(admin).createGame(
       { ...taaherCfg, gameCode: "B1", saleStart: BigInt(now + 100), saleClose: BigInt(now + 50) },
       taaherRanks, admin.address
-    )).to.be.revertedWithCustomError(Game, "InvalidParam");
+    )).to.be.revertedWithCustomError(Game, "InvalidConfig").withArgs(5);
 
     await expect(factory.connect(admin).createGame(
       { ...taaherCfg, gameCode: "B2", maxParticipation: 0 },
       taaherRanks, admin.address
-    )).to.be.revertedWithCustomError(Game, "InvalidParam");
+    )).to.be.revertedWithCustomError(Game, "InvalidConfig").withArgs(6);
 
     const overAlloc = taaherRanks.map(r => ({ ...r, allocationBps: 4000 }));
     await expect(factory.connect(admin).createGame(
       { ...taaherCfg, gameCode: "B3" }, overAlloc, admin.address
-    )).to.be.revertedWithCustomError(Game, "InvalidParam");
+    )).to.be.revertedWithCustomError(Game, "InvalidConfig").withArgs(12);
 
     const zeroWin = [{ ...taaherRanks[0], maxWinners: 0 }];
     await expect(factory.connect(admin).createGame(
       { ...taaherCfg, gameCode: "B4" }, zeroWin, admin.address
-    )).to.be.revertedWithCustomError(Game, "InvalidParam");
+    )).to.be.revertedWithCustomError(Game, "InvalidConfig").withArgs(9);
+  });
+
+  it("admin can retune the VRF settings for future games", async function () {
+    const { factory, admin, stranger } = await setup();
+    const NEW_KEY = "0x787d74caea10b2b357790d5b5247c2f63d1d91572a9846f780606e4d953677ae";
+
+    await factory.connect(admin).setVrfConfig(42n, NEW_KEY, 100_000, 3);
+    expect(await factory.vrfCallbackGasLimit()).to.equal(100_000);
+    expect(await factory.vrfSubscriptionId()).to.equal(42n);
+
+    await expect(factory.connect(admin).setVrfConfig(42n, NEW_KEY, 0, 3))
+      .to.be.revertedWithCustomError(factory, "InvalidParam");
+    await expect(factory.connect(stranger).setVrfConfig(42n, NEW_KEY, 100_000, 3))
+      .to.be.revertedWithCustomError(factory, "AccessControlUnauthorizedAccount");
   });
 
   it("upgrades (UUPS) preserving the game index; non-admin upgrade reverts", async function () {

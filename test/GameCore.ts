@@ -50,13 +50,15 @@ describe("GameCore", function () {
     { rank: 4, maxWinners: 500, prizeCategory: 1, prizeAmount: 0n, allocationBps: 1000, prizeType: 1, claimType: 0, rankDescription: "Fourth Tier" },
   ];
 
-  async function deployCountGame(ctx: any, opts: { maxParticipation?: number; price?: bigint; currency?: string; ranks?: any[]; code?: string } = {}) {
+  async function deployCountGame(ctx: any, opts: { maxParticipation?: number; price?: bigint; currency?: string; ranks?: any[]; code?: string; settlementMode?: number; currencySymbol?: string } = {}) {
     const { ethers, factory, coordinator, subId, admin, now } = ctx;
     const cfg = {
       gameCode: opts.code ?? "GAME0011", gameName: "Api-test", schemeCode: "SCH0002", schemeName: "Jackpot Pool Allocation",
       mode: 0, ticketPrice: opts.price ?? ethers.parseEther("0.1"), currency: opts.currency ?? ZeroAddress,
       saleStart: BigInt(now - 60), saleClose: BigInt(now + 3600), drawAt: 0n,
       maxParticipation: opts.maxParticipation ?? 100,
+      currencySymbol: opts.currencySymbol ?? "ETH",
+      settlementMode: opts.settlementMode ?? 0,
     };
     await factory.connect(admin).createGame(cfg, opts.ranks ?? TAAHER_RANKS, admin.address);
     const game = (await ethers.getContractFactory("GameCore")).attach(await factory.getGameByCode(cfg.gameCode));
@@ -64,12 +66,14 @@ describe("GameCore", function () {
     return game;
   }
 
-  async function deployDrawTimeGame(ctx: any, opts: { ranks?: any[]; code?: string; price?: bigint } = {}) {
+  async function deployDrawTimeGame(ctx: any, opts: { ranks?: any[]; code?: string; price?: bigint; settlementMode?: number; currencySymbol?: string } = {}) {
     const { ethers, factory, coordinator, subId, admin, now } = ctx;
     const cfg = {
       gameCode: opts.code ?? "GAMEDT01", gameName: "Draw Time Game", schemeCode: "SCH0009", schemeName: "Std Fixed",
       mode: 1, ticketPrice: opts.price ?? ethers.parseEther("0.1"), currency: ZeroAddress,
       saleStart: BigInt(now - 60), saleClose: BigInt(now + 1800), drawAt: BigInt(now + 3600), maxParticipation: 0,
+      currencySymbol: opts.currencySymbol ?? "ETH",
+      settlementMode: opts.settlementMode ?? 0,
     };
     const ranks = opts.ranks ?? [
       { rank: 1, maxWinners: 1, prizeCategory: 0, prizeAmount: ethers.parseEther("2"),   allocationBps: 0, prizeType: 1, claimType: 1, rankDescription: "Grand" },
@@ -114,7 +118,7 @@ describe("GameCore", function () {
       await expect(game.connect(buyer1).buyTickets(1n, { value: 1n }))
         .to.be.revertedWithCustomError(game, "IncorrectPayment");
       await expect(game.connect(buyer1).buyTickets(0n, { value: 0n }))
-        .to.be.revertedWithCustomError(game, "InvalidParam");
+        .to.be.revertedWithCustomError(game, "BadInput");
     });
 
     it("enforces the sale window (SaleNotOpen / SaleWindowPassed)", async function () {
@@ -124,6 +128,7 @@ describe("GameCore", function () {
         gameCode: "FUTURE", gameName: "x", schemeCode: "s", schemeName: "s",
         mode: 0, ticketPrice: ethers.parseEther("0.1"), currency: ZeroAddress,
         saleStart: BigInt(now + 1000), saleClose: BigInt(now + 2000), drawAt: 0n, maxParticipation: 10,
+        currencySymbol: "ETH", settlementMode: 0,
       };
       await factory.connect(admin).createGame(cfg, TAAHER_RANKS, admin.address);
       const game = (await ethers.getContractFactory("GameCore")).attach(await factory.getGameByCode("FUTURE"));
@@ -404,6 +409,299 @@ describe("GameCore", function () {
       const w = await ethers.getSigner(winners[0]);
       await game.connect(w).claimPrize();
       expect(await usdt.balanceOf(winners[0])).to.equal(price * 3n / 2n); // 50% of 30 = 15
+    });
+  });
+
+  // ─── OffChain registry games (card / UPI) ────────────────────────────────
+
+  describe("registry games (OffChain settlement)", function () {
+    const INR = (n: string) => BigInt(n) * 10n ** 18n;
+
+    // The production derivation: address(keccak256(userId)). Must stay identical
+    // in the API, in GameCore.participantIdOf(), and here.
+    function participantOf(ethers: any, userId: string): string {
+      return ethers.getAddress(
+        "0x" + ethers.keccak256(ethers.toUtf8Bytes(userId)).slice(-40)
+      );
+    }
+    const refOf = (ethers: any, txnId: string) => ethers.keccak256(ethers.toUtf8Bytes(txnId));
+
+    async function deployRegistryGame(ctx: any, opts: any = {}) {
+      return deployCountGame(ctx, {
+        settlementMode: 1,
+        currencySymbol: "INR",
+        price: INR("50"),
+        code: opts.code ?? "INR0001",
+        maxParticipation: opts.maxParticipation ?? 100,
+        ranks: opts.ranks,
+      });
+    }
+
+    it("stores the display currency and settlement mode on-chain", async function () {
+      const ctx = await base();
+      const game = await deployRegistryGame(ctx, { code: "INRCFG" });
+      const cfg = await game.config();
+      expect(cfg.currencySymbol).to.equal("INR");
+      expect(cfg.settlementMode).to.equal(1n);
+      expect(cfg.ticketPrice).to.equal(INR("50"));
+    });
+
+    it("registers an entry, accrues notional proceeds, and exposes it for buyer verification", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRREG" });
+
+      const p = participantOf(ethers, "USR00000020");
+      const ref = refOf(ethers, "4b6e0abe-6d1f-44b0-be1d-1d330307f9f7");
+
+      await expect(game.connect(admin).registerEntryFor(p, 2n, ref))
+        .to.emit(game, "EntryRegistered");
+
+      expect(await game.ticketsSold()).to.equal(2n);
+      expect(await game.participantCount()).to.equal(1n);
+      expect(await game.ticketsBought(p)).to.equal(2n);
+      // cost = price x quantity, accrued without any value moving
+      expect(await game.grossProceeds()).to.equal(INR("100"));
+      expect(await ethers.provider.getBalance(await game.getAddress())).to.equal(0n);
+
+      const entry = await game.entries(ref);
+      expect(entry.participant).to.equal(p);
+      expect(entry.count).to.equal(2n);
+    });
+
+    it("lets a buyer derive their own identity from their customer id", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRWHOAMI" });
+
+      const userId = "6f1a9c2e-8b47-4d51-9a3f-2c8e7b1d4059";
+      const expected = participantOf(ethers, userId);
+
+      // The contract derives it the same way the API does, so a buyer can
+      // reproduce it themselves without trusting anyone.
+      expect(await game.participantIdOf(userId)).to.equal(expected);
+
+      await game.connect(admin).registerEntryFor(expected, 4n, refOf(ethers, "whoami-1"));
+
+      // Having derived it, they can read their own tickets directly.
+      expect(await game.ticketsBought(await game.participantIdOf(userId))).to.equal(4n);
+    });
+
+    it("lets a buyer look their ticket up with the raw txnId from their receipt", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRLOOKUP" });
+
+      const txnId = "4b6e0abe-6d1f-44b0-be1d-1d330307f9f7";
+      const p = participantOf(ethers, "USR00000020");
+      await game.connect(admin).registerEntryFor(p, 3n, refOf(ethers, txnId));
+
+      // No hashing needed by the caller — paste the receipt value straight in.
+      const [participant, count] = await game.entryByTxnId(txnId);
+      expect(participant).to.equal(p);
+      expect(count).to.equal(3n);
+
+      // An unknown reference reads as empty rather than reverting.
+      const [none, zero] = await game.entryByTxnId("not-a-real-txn");
+      expect(none).to.equal(ethers.ZeroAddress);
+      expect(zero).to.equal(0n);
+    });
+
+    it("rejects a duplicate txnId, so retries are safe", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRDUP" });
+
+      const p = participantOf(ethers, "USR1");
+      const ref = refOf(ethers, "txn-same");
+      await game.connect(admin).registerEntryFor(p, 1n, ref);
+
+      await expect(game.connect(admin).registerEntryFor(p, 1n, ref))
+        .to.be.revertedWithCustomError(game, "DuplicateEntry");
+      expect(await game.ticketsSold()).to.equal(1n);
+    });
+
+    it("counts one userId as a single participant across repeat purchases", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRREPEAT", maxParticipation: 3 });
+
+      const p = participantOf(ethers, "USR-REPEAT");
+      await game.connect(admin).registerEntryFor(p, 1n, refOf(ethers, "t1"));
+      await game.connect(admin).registerEntryFor(p, 2n, refOf(ethers, "t2"));
+      await game.connect(admin).registerEntryFor(p, 3n, refOf(ethers, "t3"));
+
+      expect(await game.participantCount()).to.equal(1n); // one person, not three
+      expect(await game.ticketsBought(p)).to.equal(6n);
+      expect(await game.status()).to.equal(0n);           // cap of 3 NOT filled
+    });
+
+    it("auto-fires the draw when the participant cap fills", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRCAP", maxParticipation: 3 });
+
+      await game.connect(admin).registerEntryFor(participantOf(ethers, "U1"), 1n, refOf(ethers, "a"));
+      await game.connect(admin).registerEntryFor(participantOf(ethers, "U2"), 1n, refOf(ethers, "b"));
+      await expect(game.connect(admin).registerEntryFor(participantOf(ethers, "U3"), 1n, refOf(ethers, "c")))
+        .to.emit(game, "DrawRequested");
+
+      expect(await game.status()).to.equal(1n); // Drawing
+      await expect(
+        game.connect(admin).registerEntryFor(participantOf(ethers, "U4"), 1n, refOf(ethers, "d"))
+      ).to.be.revertedWithCustomError(game, "NotInStatus");
+    });
+
+    it("blocks wallet buying and prefunding so funds can never be stranded", async function () {
+      const ctx = await base();
+      const { ethers, buyer1 } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRNOBUY" });
+
+      await expect(game.connect(buyer1).buyTickets(1n, { value: INR("50") }))
+        .to.be.revertedWithCustomError(game, "WrongSettlementMode");
+      await expect(game.connect(buyer1).prefundNative({ value: ethers.parseEther("1") }))
+        .to.be.revertedWithCustomError(game, "WrongSettlementMode");
+    });
+
+    it("rejects registration on an OnChain game, and rejects a zero/blank entry", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+
+      const onChain = await deployCountGame(ctx, { code: "ONCHAIN1" });
+      await expect(
+        onChain.connect(admin).registerEntryFor(participantOf(ethers, "U"), 1n, refOf(ethers, "r"))
+      ).to.be.revertedWithCustomError(onChain, "WrongSettlementMode");
+
+      const game = await deployRegistryGame(ctx, { code: "INRBAD" });
+      const p = participantOf(ethers, "U");
+      await expect(game.connect(admin).registerEntryFor(ethers.ZeroAddress, 1n, refOf(ethers, "r")))
+        .to.be.revertedWithCustomError(game, "InvalidEntry");
+      await expect(game.connect(admin).registerEntryFor(p, 0n, refOf(ethers, "r")))
+        .to.be.revertedWithCustomError(game, "InvalidEntry");
+      await expect(game.connect(admin).registerEntryFor(p, 1n, "0x" + "00".repeat(32)))
+        .to.be.revertedWithCustomError(game, "InvalidEntry");
+    });
+
+    it("only the operator may register entries", async function () {
+      const ctx = await base();
+      const { ethers, stranger } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRAUTH" });
+      await expect(
+        game.connect(stranger).registerEntryFor(participantOf(ethers, "U"), 1n, refOf(ethers, "r"))
+      ).to.be.revertedWithCustomError(game, "AccessControlUnauthorizedAccount");
+    });
+
+    it("enforces the sale window for registered entries", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRWIN" });
+
+      await ethers.provider.send("evm_increaseTime", [3700]);
+      await ethers.provider.send("evm_mine", []);
+      await expect(
+        game.connect(admin).registerEntryFor(participantOf(ethers, "U"), 1n, refOf(ethers, "r"))
+      ).to.be.revertedWithCustomError(game, "SaleWindowPassed");
+    });
+
+    it("full INR cycle: 5 buyers -> 1 winner owed 50% of the rupee pool, claiming disabled", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRCYCLE", maxParticipation: 5 });
+
+      for (let i = 1; i <= 5; i++) {
+        await game.connect(admin).registerEntryFor(
+          participantOf(ethers, `USR${i}`), 1n, refOf(ethers, `txn-${i}`)
+        );
+      }
+      // 5 tickets x ₹50 = ₹250 notional pool
+      expect(await game.grossProceeds()).to.equal(INR("250"));
+
+      await fulfill(ctx, game);
+      await game.finalizeDraw(10n);
+      expect(await game.status()).to.equal(4n); // Finalized
+
+      const winners = await game.getWinners();
+      expect(winners.length).to.equal(1);       // 5 participants -> 1 winner
+      const info = await game.winnerInfo(winners[0]);
+      expect(info.amount).to.equal(INR("125")); // rank 1 = 50% of ₹250
+      expect(await game.totalPrizeLiability()).to.equal(INR("125"));
+
+      // Prize is published as an amount the admin pays off-chain; the contract
+      // holds nothing and claiming is closed off for every caller.
+      expect(await ethers.provider.getBalance(await game.getAddress())).to.equal(0n);
+      await game.connect(admin).approvePrize(winners[0]); // approval still recorded
+      await expect(game.connect(admin).claimPrize())
+        .to.be.revertedWithCustomError(game, "OffChainSettlement");
+    });
+
+    it("recovers a draw Chainlink never fulfilled, instead of freezing forever", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRSTUCK", maxParticipation: 3 });
+
+      for (let i = 1; i <= 3; i++) {
+        await game.connect(admin).registerEntryFor(
+          participantOf(ethers, `S${i}`), 1n, refOf(ethers, `s-${i}`)
+        );
+      }
+      const firstRequest = await game.s_requestId();
+      expect(await game.status()).to.equal(1n); // Drawing, awaiting VRF
+
+      // Too soon: the operator must not be able to churn requests.
+      await expect(game.connect(admin).retryDraw())
+        .to.be.revertedWithCustomError(game, "DrawNotDue");
+
+      await ethers.provider.send("evm_increaseTime", [3700]); // past DRAW_RETRY_DELAY
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(game.connect(admin).retryDraw()).to.emit(game, "DrawRequested");
+      const secondRequest = await game.s_requestId();
+      expect(secondRequest).to.not.equal(firstRequest);
+      expect(await game.status()).to.equal(1n);
+      expect(await game.participantCount()).to.equal(3n); // list untouched — still fair
+
+      // A late fulfilment of the ABANDONED request must not seed the draw. The
+      // coordinator does not revert when a consumer callback fails (the real one
+      // behaves the same), so assert the state instead: the game ignored it.
+      try {
+        await ctx.coordinator.fulfillRandomWords(firstRequest, await game.getAddress());
+      } catch { /* some coordinator versions surface the failure */ }
+      expect(await game.drawSeed()).to.equal(0n);
+      expect(await game.status()).to.equal(1n); // still Drawing, not seeded
+
+      // The live request still works, and the game completes normally.
+      await ctx.coordinator.fulfillRandomWords(secondRequest, await game.getAddress());
+      await game.finalizeDraw(10n);
+      expect(await game.status()).to.equal(4n);
+      expect((await game.getWinners()).length).to.equal(1);
+    });
+
+    it("DRAW_TIME registry game: operator draws after drawAt", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployDrawTimeGame(ctx, {
+        code: "INRDT", settlementMode: 1, currencySymbol: "INR", price: INR("50"),
+        ranks: [
+          { rank: 1, maxWinners: 1, prizeCategory: 1, prizeAmount: 0n, allocationBps: 6000, prizeType: 1, claimType: 0, rankDescription: "Grand" },
+        ],
+      });
+
+      for (let i = 1; i <= 4; i++) {
+        await game.connect(admin).registerEntryFor(
+          participantOf(ethers, `DT${i}`), 1n, refOf(ethers, `dt-${i}`)
+        );
+      }
+      await ethers.provider.send("evm_increaseTime", [3700]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(game.connect(admin).requestDraw()).to.emit(game, "DrawRequested");
+      await fulfill(ctx, game);
+      await game.finalizeDraw(10n);
+
+      const winners = await game.getWinners();
+      expect(winners.length).to.equal(1);
+      const info = await game.winnerInfo(winners[0]);
+      expect(info.amount).to.equal(INR("120")); // 60% of 4 x ₹50 = ₹200
     });
   });
 });

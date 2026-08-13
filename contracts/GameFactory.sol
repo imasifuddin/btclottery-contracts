@@ -106,6 +106,25 @@ contract GameFactory is
         emit GameCreated(newId, gameAddress, cfg.gameCode, cfg.schemeCode, cfg.currency, msg.sender);
     }
 
+    /// @notice Updates the VRF settings applied to games created from now on.
+    ///         Games already deployed keep the settings they were born with —
+    ///         those are immutable in each GameCore.
+    /// @dev Chiefly for callbackGasLimit. Chainlink reserves subscription funds
+    ///      against the declared limit at the gas lane's maximum price, so an
+    ///      oversized value locks up far more LINK than a draw actually costs.
+    function setVrfConfig(
+        uint256 subscriptionId,
+        bytes32 keyHash,
+        uint32 callbackGasLimit,
+        uint16 requestConfirmations
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (callbackGasLimit == 0) revert InvalidParam("callbackGasLimit must be > 0");
+        vrfSubscriptionId = subscriptionId;
+        vrfKeyHash = keyHash;
+        vrfCallbackGasLimit = callbackGasLimit;
+        vrfRequestConfirmations = requestConfirmations;
+    }
+
     function getGameCount() external view returns (uint256) { return _games.length; }
     function getGame(uint256 id) external view returns (address) { return _gameById[id]; }
     function getGameByCode(string calldata code) external view returns (address) { return _gameByCode[code]; }
