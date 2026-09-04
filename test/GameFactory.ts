@@ -166,7 +166,7 @@ describe("GameFactory", function () {
     expect(await factory.vrfSubscriptionId()).to.equal(42n);
 
     await expect(factory.connect(admin).setVrfConfig(42n, NEW_KEY, 0, 3))
-      .to.be.revertedWithCustomError(factory, "InvalidParam");
+      .to.be.revertedWithCustomError(factory, "BadConfig");
     await expect(factory.connect(stranger).setVrfConfig(42n, NEW_KEY, 100_000, 3))
       .to.be.revertedWithCustomError(factory, "AccessControlUnauthorizedAccount");
   });

@@ -418,7 +418,7 @@ describe("GameCore", function () {
     const INR = (n: string) => BigInt(n) * 10n ** 18n;
 
     // The production derivation: address(keccak256(userId)). Must stay identical
-    // in the API, in GameCore.participantIdOf(), and here.
+    // in the API, in GameCore.lookupUser(), and here.
     function participantOf(ethers: any, userId: string): string {
       return ethers.getAddress(
         "0x" + ethers.keccak256(ethers.toUtf8Bytes(userId)).slice(-40)
@@ -469,22 +469,73 @@ describe("GameCore", function () {
       expect(entry.count).to.equal(2n);
     });
 
-    it("lets a buyer derive their own identity from their customer id", async function () {
+    it("answers a customer's whole question from their id alone", async function () {
       const ctx = await base();
       const { ethers, admin } = ctx;
-      const game = await deployRegistryGame(ctx, { code: "INRWHOAMI" });
+      const game = await deployRegistryGame(ctx, { code: "INRWHOAMI", maxParticipation: 3 });
 
-      const userId = "6f1a9c2e-8b47-4d51-9a3f-2c8e7b1d4059";
-      const expected = participantOf(ethers, userId);
+      const mine = "6f1a9c2e-8b47-4d51-9a3f-2c8e7b1d4059";
+      const stranger = "11111111-2222-3333-4444-555555555555";
 
-      // The contract derives it the same way the API does, so a buyer can
-      // reproduce it themselves without trusting anyone.
-      expect(await game.participantIdOf(userId)).to.equal(expected);
+      // Someone who has not entered gets a clean negative, not an error.
+      let r = await game.lookupUser(mine);
+      expect(r.participated).to.equal(false);
+      expect(r.tickets).to.equal(0n);
+      expect(r.won).to.equal(false);
 
-      await game.connect(admin).registerEntryFor(expected, 4n, refOf(ethers, "whoami-1"));
+      await game.connect(admin).registerEntryFor(
+        participantOf(ethers, mine), 4n, refOf(ethers, "whoami-1")
+      );
 
-      // Having derived it, they can read their own tickets directly.
-      expect(await game.ticketsBought(await game.participantIdOf(userId))).to.equal(4n);
+      r = await game.lookupUser(mine);
+      expect(r.participated).to.equal(true);
+      expect(r.tickets).to.equal(4n);
+      expect(r.won).to.equal(false);          // draw has not run yet
+
+      // A different customer id must not see someone else's entry.
+      const other = await game.lookupUser(stranger);
+      expect(other.participated).to.equal(false);
+      expect(other.tickets).to.equal(0n);
+    });
+
+    it("reports the prize through lookupUser once the draw has run", async function () {
+      const ctx = await base();
+      const { ethers, admin } = ctx;
+      const game = await deployRegistryGame(ctx, { code: "INRWHOWON", maxParticipation: 3 });
+
+      const ids = [
+        "6f1a9c2e-8b47-4d51-9a3f-2c8e7b1d4059",
+        "a3d7e015-2f6b-4c88-b1e4-9d05c7a3f621",
+        "c82b4f93-7a1d-4e50-8b6c-3f9a2d1e7b48",
+      ];
+      for (let i = 0; i < ids.length; i++) {
+        await game.connect(admin).registerEntryFor(
+          participantOf(ethers, ids[i]), 1n, refOf(ethers, `won-${i}`)
+        );
+      }
+      await fulfill(ctx, game);
+      await game.finalizeDraw(10n);
+
+      const winner = (await game.getWinners())[0];
+      const results = await Promise.all(ids.map((id) => game.lookupUser(id)));
+
+      // Exactly one of the three is told they won, and it is the recorded winner.
+      const wonFlags = results.map((r: any) => r.won);
+      expect(wonFlags.filter(Boolean).length).to.equal(1);
+
+      const idx = wonFlags.indexOf(true);
+      expect(participantOf(ethers, ids[idx])).to.equal(winner);
+      expect(results[idx].rank).to.equal(1);
+      // 3 tickets x INR 50 = 150, jackpot rank is 50%
+      expect(results[idx].prizeAmount).to.equal(INR("75"));
+
+      // The others are told plainly that they did not win.
+      for (let i = 0; i < ids.length; i++) {
+        if (i === idx) continue;
+        expect(results[i].participated).to.equal(true);
+        expect(results[i].won).to.equal(false);
+        expect(results[i].prizeAmount).to.equal(0n);
+      }
     });
 
     it("lets a buyer look their ticket up with the raw txnId from their receipt", async function () {

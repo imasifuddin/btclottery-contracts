@@ -595,14 +595,29 @@ contract GameCore is VRFConsumerBaseV2Plus, ReentrancyGuard, Pausable, AccessCon
         return (e.participant, e.count);
     }
 
-    /// @notice The on-chain identity for a given customer id. Lets a buyer
-    ///         derive their own participant address from the id they log in
-    ///         with, and then read their tickets and any prize themselves.
-    /// @dev Must stay identical to the API's derivation. Customer ids are
-    ///      expected to be long random values — a guessable id would let anyone
-    ///      enumerate participants and link them to their activity.
-    function participantIdOf(string calldata userId) external pure returns (address) {
-        return address(uint160(uint256(keccak256(bytes(userId)))));
+    /// @notice Everything a customer needs in one call, from the id they signed
+    ///         up with. Lets a "check my entry" box take a single input and show
+    ///         a plain answer, with no intermediate identifiers on screen.
+    /// @return participated Whether this customer holds any ticket in this game.
+    /// @return tickets      How many tickets they hold.
+    /// @return won          Whether they were drawn as a winner.
+    /// @return rank         Prize tier they won (0 if they did not).
+    /// @return prizeAmount  Amount owed to them, 18 decimals (0 if they did not).
+    function lookupUser(string calldata userId)
+        external
+        view
+        returns (bool participated, uint256 tickets, bool won, uint16 rank, uint128 prizeAmount)
+    {
+        address p = address(uint160(uint256(keccak256(bytes(userId)))));
+        tickets = ticketsBought[p];
+        participated = tickets > 0;
+
+        WinnerInfo storage w = winnerInfo[p];
+        won = w.status != ClaimStatus.None;
+        if (won) {
+            rank = _ranks[w.rankIdx].rank;
+            prizeAmount = w.amount;
+        }
     }
 
 

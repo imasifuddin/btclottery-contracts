@@ -43,6 +43,8 @@ contract GameFactory is
     );
 
     error InvalidParam(string reason);
+    /// @notice A required address was zero, or callbackGasLimit was 0.
+    error BadConfig();
     error GameCodeExists(string gameCode);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -59,8 +61,8 @@ contract GameFactory is
 
     function initialize(InitParams calldata p) public initializer {
         if (p.admin == address(0) || p.vrfCoordinator == address(0))
-            revert InvalidParam("zero address");
-        if (p.vrfCallbackGasLimit == 0) revert InvalidParam("callbackGasLimit must be > 0");
+            revert BadConfig();
+        if (p.vrfCallbackGasLimit == 0) revert BadConfig();
 
         __AccessControl_init();
         __Pausable_init();
@@ -118,7 +120,7 @@ contract GameFactory is
         uint32 callbackGasLimit,
         uint16 requestConfirmations
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (callbackGasLimit == 0) revert InvalidParam("callbackGasLimit must be > 0");
+        if (callbackGasLimit == 0) revert BadConfig();
         vrfSubscriptionId = subscriptionId;
         vrfKeyHash = keyHash;
         vrfCallbackGasLimit = callbackGasLimit;
